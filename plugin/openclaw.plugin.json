@@ -1,0 +1,412 @@
+{
+  "id": "dafeiyu-core",
+  "name": "Dafeiyu Core",
+  "version": "0.1.0",
+  "description": "Persistent emotion, relations, and proactive-social state for the dafeiyu agent.",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "emotion_state",
+      "emotion_nudge",
+      "remember_about",
+      "recall_about",
+      "who_is",
+      "note_about",
+      "topic_state",
+      "proactive_state",
+      "proactive_want",
+      "dafeiyu_approve",
+      "dafeiyu_requests",
+      "dafeiyu_proactive_take",
+      "dafeiyu_sticker",
+      "dafeiyu_show",
+      "dafeiyu_new_sticker",
+      "dafeiyu_voice",
+      "qq_group_info",
+      "qq_members",
+      "qq_whois",
+      "qq_mute",
+      "qq_kick",
+      "qq_set_card",
+      "qq_at",
+      "qq_qzone",
+      "qq_like",
+      "qq_poke",
+      "qq_react",
+      "qq_profile",
+      "qq_online",
+      "qq_notice",
+      "qq_friends",
+      "qq_groups",
+      "qq_recent",
+      "qq_history",
+      "qq_hold_grudge",
+      "qq_recall_grudge",
+      "experience_resolve",
+      "fact_reject",
+      "douyin_plan",
+      "douyin_record",
+      "douyin_act",
+      "note_diary",
+      "note_self",
+      "douyin_status",
+      "note_effect",
+      "effect_state",
+      "goal_close",
+      "goal_step",
+      "goal_add",
+      "self_state",
+      "need_help",
+      "intent_outcome",
+      "recall_links",
+      "sleep_review",
+      "want_do",
+      "activity_state"
+    ]
+  },
+  "hooks": {
+    "allowConversationAccess": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "agents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Agent ids this plugin manages."
+      },
+      "emotion": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "halfLifeMinutes": {
+            "type": "number",
+            "minimum": 5,
+            "maximum": 2880
+          },
+          "baseline": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "injectPrompt": {
+            "type": "boolean"
+          }
+        }
+      },
+      "memory": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "dailyLog": {
+            "type": "boolean"
+          },
+          "maxDailyLines": {
+            "type": "integer",
+            "minimum": 10,
+            "maximum": 2000
+          }
+        }
+      },
+      "experience": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "poolInPrompt": {
+            "type": "boolean"
+          }
+        }
+      },
+      "proactive": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "主动开口总开关。关闭不影响回复别人。"
+          },
+          "unlimited": {
+            "type": "boolean",
+            "default": false,
+            "description": "放开节奏限制。设为 true 时跳过缓冲、冷却、久未互动、排重四道闸，只在完全信任的场景下用。默认 false，闸门才会真正生效。"
+          },
+          "bufferMinutes": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 120,
+            "description": "对方刚说完话的缓冲时间。只管主动开口，不影响回复。"
+          },
+          "replyWindowMinutes": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 720,
+            "description": "对方在这个时间内说过话，你就是在正常接话，不算主动开口，所有限制都不生效。"
+          },
+          "maxSilenceHours": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 168,
+            "description": "超过这么久没互动就不再主动开口。填 0 = 关闭此限制（默认）。"
+          },
+          "cooldownMinutes": {
+            "type": "number",
+            "minimum": 5,
+            "maximum": 2880,
+            "description": "对同一个人两次主动开口的最小间隔。"
+          },
+          "quietHoursStart": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "description": "安静时段开始小时（按 timeZone）。期间不主动开口，但照常回复。"
+          },
+          "quietHoursEnd": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "description": "安静时段结束小时。"
+          },
+          "dailyCap": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200,
+            "description": "（已废弃，不生效）旧版的每日主动开口上限。计数会让角色读到「30/30」然后一整天不说话，与「连续的自我」相反，已移除。此键保留只为兼容旧配置。"
+          },
+          "requireValue": {
+            "type": "boolean",
+            "description": "没干货的话直接丢掉，不排进队列。"
+          },
+          "impulseTtlHours": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 48,
+            "description": "排队的想法多久过期。过期就丢掉，不会隔天突然发。"
+          },
+          "timeZone": {
+            "type": "string",
+            "description": "安静时段和每日上限使用的时区，固定写死避免宿主时区变化。"
+          },
+          "ownerTargets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "允许主动联系的对象 key 白名单。只有这些对象可以在没有过历史消息时被主动开口。"
+          },
+          "targets": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "targetKey 到实际发送地址的映射，执行器靠它知道往哪发。"
+          }
+        }
+      },
+      "autonomy": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "自主处理候选的总开关。关闭时收集与打分都不生效，行为回到旧版。"
+          },
+          "threshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "候选分数高于这条线才算值得做。低于它只是记下来。"
+          },
+          "maxPerWake": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 20,
+            "description": "一次唤醒最多做几件事。默认 1：这不是批处理。"
+          },
+          "talkGapMinutes": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1440,
+            "description": "两次主动开口的最小间隔。"
+          },
+          "familiarityFloor": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "熟悉度低于这条线就不主动找上门，避免对陌生人自来熟。"
+          },
+          "maxPerDay": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200,
+            "description": "每天最多自主出手几次，跨天清零。"
+          },
+          "quietStartHour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "description": "安静时段开始小时（按 timeZone），期间不自主出手。"
+          },
+          "quietEndHour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "description": "安静时段结束小时。"
+          },
+          "timeZone": {
+            "type": "string",
+            "description": "小时门限使用的时区，固定写死，避免宿主时区变化导致半夜开口。"
+          }
+        }
+      },
+      "reminders": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "groups": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "sets": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    }
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "允许 @ 的群，以及每个群里被批准的 QQ 号组合。"
+          }
+        }
+      },
+      "douyin": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "allowActions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "like",
+                "comment",
+                "share"
+              ]
+            }
+          },
+          "maxFramesPerVideo": {
+            "type": "number"
+          },
+          "cooldownMinutes": {
+            "type": "number"
+          }
+        }
+      },
+      "voice": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ownerTargets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "这些聊天对象鼓励多用语音（可写 private:<QQ号> 或 person:onebot:<QQ号>）。"
+          },
+          "suppressText": {
+            "type": "boolean",
+            "description": "本轮已经发过语音时，压掉同时产生的文字，避免一前一后两条。"
+          },
+          "suppressWindowSeconds": {
+            "type": "integer",
+            "minimum": 30,
+            "maximum": 600,
+            "description": "发过语音后多少秒内的文字算同一轮。"
+          }
+        }
+      },
+      "curiosity": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Gaps she ran into and has not answered. Off leaves the gap list unread, not deleted.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Record and inject knowledge gaps."
+          },
+          "budget": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3,
+            "default": 1,
+            "description": "Max gaps proposed per wake. A hard cap, not a probability; raising it turns curiosity into a to-do list."
+          },
+          "sources": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Per-input switches. browse fires constantly, question almost never; one global toggle would silence both.",
+            "properties": {
+              "recall": {
+                "type": "boolean",
+                "default": true,
+                "description": "Her own recall came back empty."
+              },
+              "question": {
+                "type": "boolean",
+                "default": true,
+                "description": "She said out loud that she does not know."
+              },
+              "search": {
+                "type": "boolean",
+                "default": true,
+                "description": "She ran a web search herself."
+              },
+              "browse": {
+                "type": "boolean",
+                "default": true,
+                "description": "Unfamiliar term seen while scrolling."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

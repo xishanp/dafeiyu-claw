@@ -1,0 +1,10 @@
+{
+  "name": "dafeiyu-core",
+  "version": "0.1.0",
+  "description": "Persistent emotion, relations, and proactive-social state for the dafeiyu agent.",
+  "type": "module",
+  "main": "index.js",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}

@@ -252,6 +252,41 @@ function recent(workspaceDir, opts = {}) {
 }
 
 /**
+ * What one person said recently, newest last.
+ *
+ * Needed by gap detection: "he said the opposite of what he said before" is
+ * unanswerable without the earlier line, and the earlier line is not in memory —
+ * it is in the day file under a heading that names the speaker.
+ *
+ * Grouped by speaker rather than by day, because a contradiction is about a
+ * person. Reading every line regardless of who said it would let one person's
+ * preference collide with another's, which is not a contradiction, it is a
+ * misattribution.
+ *
+ * Returns [{ what, at }] bounded to `limit`, matching how much context the
+ * comparison can actually hold.
+ */
+function recentSaidBy(workspaceDir, who, limit = 60) {
+  const name = String(who || "").trim();
+  if (!name) return [];
+  const out = [];
+  // Only the tail of each day is read: a contradiction on 2026-10-30 about a
+  // preference restated today is still a contradiction, but reaching back a week
+  // per message would be the expensive way to find one.
+  for (const { day, body } of recent(workspaceDir, { days: 3 }).reverse()) {
+    let speaker = null;
+    for (const line of body.split("\n")) {
+      const head = line.match(/^##\s+\S+\s*(?:·\s*(.+))?$/);
+      if (head) { speaker = (head[1] || "").trim(); continue; }
+      if (!line.startsWith("对方:")) continue;
+      if (speaker && !speaker.includes(name) && !name.includes(speaker)) continue;
+      out.push({ what: line.replace(/^对方:\s*/, "").trim(), at: day });
+    }
+  }
+  return out.slice(-limit);
+}
+
+/**
  * The part of today's file written after `cursor`.
  *
  * Reflection used to read the tail of the file every time it ran. A heartbeat
@@ -302,4 +337,4 @@ function markReflected(workspaceDir, cursor) {
   }
 }
 
-export { noteTurn, noteDiary, noteEvent, recent, tailAfter, readCursor, markReflected, dayFile };
+export { noteTurn, noteDiary, noteEvent, recent, recentSaidBy, tailAfter, readCursor, markReflected, dayFile };

@@ -50,10 +50,29 @@ try {
 // gaps() just returns [] and every caller treats that as "nothing to say".
 check("活动候选池非空", gaps.length > 0, `${gaps.length} 条`);
 
-// collect() returning one item is starvation with a nicer costume: she has
-// exactly one thing to think about. Measured 2026-11-05 with one open want, it
-// returned 1 for an entire afternoon.
-check("全部候选 >= 2 条", pool.length >= 2, `${pool.length} 条`);
+// An EMPTY pool is a correct outcome now, not a failure.
+//
+// This check used to demand pool.length >= 2, on the reading that "one candidate
+// is starvation with a nicer costume". That was right while `gap` and `horizon`
+// were pool entries — the pool was the only thing that could ever reach her, so
+// an empty one meant she would sit there.
+//
+// 2026-11-06 that changed: exploring is no longer a scored candidate, it is the
+// caller's `whenEmpty` fallback in decide(). So an empty pool now means exactly
+// what it should mean — nothing in hand — and the wake resolves to a blank
+// direction instead of rest. Demanding >= 2 would force the list to keep
+// manufacturing filler (「试试拍一张」) to satisfy the checker, which is the
+// behaviour that was just removed.
+//
+// What is still worth catching: a pool with exactly ONE item that is not a want,
+// i.e. filler standing in for a decision.
+const onlyOne = pool.length === 1;
+const loneIsWant = onlyOne && pool[0].kind === "want";
+check(
+  "候选池：空是正常，单条填充不正常",
+  !onlyOne || loneIsWant,
+  pool.length === 0 ? "空（由 whenEmpty 兜底去探索）" : `${pool.length} 条`,
+);
 
 // Her own wants must never be crowded out by novelty suggestions.
 const wantCands = pool.filter((c) => c.kind === "want");

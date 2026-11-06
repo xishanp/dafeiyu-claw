@@ -1,213 +1,282 @@
-// Offline verification of the curiosity store and its extractors.
-// Run: node --test test/curiosity.test.mjs
+// Tests for the curiosity layer.
+//
+// The mechanism has one job: notice a specific thing she does not have, and —
+// if it keeps pulling on her — turn it into something she has decided to find
+// out. Everything here checks one of those two links, or checks the guards that
+// keep the list from filling with noise.
+//
+// History worth keeping in mind while reading: an earlier version recorded
+// *failed lookups* as gaps. It passed its own tests and produced zero output in
+// 313 real turns, because a failed lookup is not curiosity. These tests are
+// shaped to catch that class of mistake — each one ends by asking whether a
+// real entry came out, not whether a function returned without throwing.
 
+import { test } from "node:test";
+import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
-import assert from "node:assert";
 
 import * as curiosity from "../lib/curiosity.js";
 import * as extract from "../lib/curiosity-extract.js";
 
 function freshWs() {
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "dafeiyu-curiosity-"));
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "curiosity-"));
   fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  fs.mkdirSync(path.join(ws, "memory", "facts"), { recursive: true });
   return ws;
 }
 
-const recallEmpty = (q) => ({
-  content: [{ type: "text", text: `没找到关于「${q}」的牵连。要么本来就没记，要么还没连上。` }],
-});
-const recallHit = (q) => ({
-  content: [{ type: "text", text: `找到 3 条关于「${q}」的记忆` }],
+// ── Extraction: what counts as a candidate ────────────────────────────────
+
+test("latin: only name-shaped tokens survive", () => {
+  const got = extract.latin("Python is a language. Zink is a gallium driver.");
+  assert.deepEqual(got, ["Python", "Zink"]);
+  // `language` and `driver` are ordinary vocabulary. An earlier version
+  // accepted every 4+ letter word and produced both of these from this exact
+  // sentence, which is what taught the list to be unreadable.
+  assert.ok(!got.includes("language"));
+  assert.ok(!got.includes("driver"));
 });
 
-// ── store ────────────────────────────────────────────────────────────
+test("latin: identifiers with digits or punctuation are names", () => {
+  const got = extract.latin("我用 node.js 和 gpt-4.1 还有 c++");
+  assert.ok(got.includes("node.js"), JSON.stringify(got));
+  assert.ok(got.includes("gpt-4.1"), JSON.stringify(got));
+});
 
-test("first mention creates one open gap", () => {
+test("latin: tool noise never becomes a candidate", () => {
+  const got = extract.latin('{"error":"null","status":"ok","value":123}');
+  assert.deepEqual(got, []);
+});
+
+test("zh: a definition question yields the noun, not the sentence", () => {
+  const got = extract.zhQuestions("到底什么是 redox？");
+  assert.ok(got.includes("redox"), JSON.stringify(got));
+  // The whole sentence must not also appear: `redox` is searchable, the
+  // sentence is not, and two entries for one unknown means two lookups.
+  assert.ok(!got.some((g) => g.includes("到底什么是")), JSON.stringify(got));
+});
+
+test("zh: a question with no single noun is kept whole", () => {
+  const got = extract.zhQuestions("古代几万人打仗，靠什么知道该进还是该退？");
+  assert.equal(got.length, 1, JSON.stringify(got));
+  assert.ok(got[0].includes("靠什么"), got[0]);
+});
+
+test("zh: a question containing a space is not truncated", () => {
+  // Real line from her own notes. The separator set originally excluded ASCII
+  // space, so this came back cut at the length cap.
+  const got = extract.zhQuestions("为什么不直接烤 非用 2.45GHz？");
+  assert.ok(got.some((g) => g.includes("2.45GHz")), JSON.stringify(got));
+});
+
+test("zh: questions about a person are conversational, not curious", () => {
+  assert.deepEqual(extract.zhQuestions("你为什么这样？"), []);
+  assert.deepEqual(extract.zhQuestions("我该怎么办？"), []);
+});
+
+test("zh: a declarative sentence ending in a question mark is not a gap", () => {
+  assert.deepEqual(extract.zhQuestions("今天天气很好？"), []);
+});
+
+test("names: output is capped and deduplicated", () => {
+  const got = extract.names("Zink zink ZINK Mesa Vulkan wgpu Turnip", { max: 3 });
+  assert.equal(got.length, 3, JSON.stringify(got));
+  assert.equal(new Set(got.map((g) => g.toLowerCase())).size, 3);
+});
+
+// ── Key normalisation ─────────────────────────────────────────────────────
+
+test("keyOf: one thing said two ways lands on one key", () => {
+  assert.equal(curiosity.keyOf("Zink"), curiosity.keyOf("ZINK"));
+  assert.equal(
+    curiosity.keyOf("为什么不直接烤 非用 2.45GHz？"),
+    curiosity.keyOf("为什么不直接烤非用2.45GHz"),
+  );
+});
+
+// ── Noticing ──────────────────────────────────────────────────────────────
+
+test("notice: a known name is not a noticing", () => {
   const ws = freshWs();
-  const g = curiosity.note(ws, "某种作物减产的原因", { source: "recall" });
-  assert.ok(g);
-  assert.equal(g.status, "open");
-  assert.equal(g.times_encountered, 1);
-  assert.deepEqual(g.sources, ["recall"]);
-  assert.equal(curiosity.gaps(ws).length, 1);
+  assert.equal(curiosity.notice(ws, "python", { known: ["python"] }), null);
 });
 
-test("repeat mention accumulates rather than duplicating", () => {
+test("notice: an unknown name is recorded", () => {
   const ws = freshWs();
-  curiosity.note(ws, "某种作物减产的原因", { source: "recall" });
-  curiosity.note(ws, "某种作物减产的原因", { source: "browse" });
-  const g = curiosity.note(ws, "某种作物减产的原因", { source: "search" });
-  assert.equal(g.times_encountered, 3);
-  assert.deepEqual(g.sources.sort(), ["browse", "recall", "search"]);
-  assert.equal(curiosity.gaps(ws).length, 1, "three sightings, one gap");
-  assert.ok(g.confidence > 0.7, "confidence should climb with encounters");
+  const e = curiosity.notice(ws, "Zink", { known: ["python"] });
+  assert.ok(e);
+  assert.equal(e.display, "Zink");
+  assert.equal(e.seen, 1);
+  assert.equal(e.status, "open");
 });
 
-test("topic normalisation folds spacing and punctuation", () => {
+test("notice: meeting it again increments seen", () => {
+  // This is the link that was broken. `familiar()` used to fold her own
+  // noticings into the known-set, so the second encounter with `Zink` was
+  // rejected as "already known" and `seen` stayed at 1 forever. Nothing could
+  // then reach the threshold that turns a noticing into a want.
   const ws = freshWs();
-  curiosity.note(ws, "「Zink 和 Vulkan」", { source: "recall" });
-  curiosity.note(ws, "zink 和 vulkan。", { source: "browse" });
-  assert.equal(curiosity.gaps(ws).length, 1);
+  curiosity.notice(ws, "Zink", { known: [] });
+  const second = curiosity.notice(ws, "Zink", { known: [] });
+  assert.equal(second.seen, 2);
+  const third = curiosity.notice(ws, "Zink", { known: [] });
+  assert.equal(third.seen, 3);
 });
 
-test("a mention below the confidence floor is refused", () => {
+test("notice: the better spelling wins without letting caps overwrite it", () => {
   const ws = freshWs();
-  assert.equal(curiosity.note(ws, "随便什么东西", { confidence: 0.1 }), null);
-  assert.equal(curiosity.gaps(ws).length, 0);
+  curiosity.notice(ws, "DeepSeek", {});
+  const e = curiosity.notice(ws, "DEEPSEEK", {});
+  assert.equal(e.display, "DeepSeek");
 });
 
-test("single characters and empty topics are refused", () => {
+test("notice: reasons accumulate but stay bounded", () => {
   const ws = freshWs();
-  assert.equal(curiosity.note(ws, "", { source: "recall" }), null);
-  assert.equal(curiosity.note(ws, "   ", { source: "recall" }), null);
-  assert.equal(curiosity.note(ws, "a", { source: "recall" }), null);
+  for (let i = 0; i < 8; i++) curiosity.notice(ws, "Zink", { reason: `r${i}` });
+  const [n] = curiosity.noticings(ws);
+  assert.ok(n.reasons.length <= 4, JSON.stringify(n.reasons));
+  assert.equal(n.reasons.at(-1), "r7");
 });
 
-test("more encounters outranks fewer", () => {
+// ── Pull, propose, hand off ───────────────────────────────────────────────
+
+test("pull: recurrence raises it, one-off stays low", () => {
   const ws = freshWs();
-  curiosity.note(ws, "冷门一点的问题", { source: "recall" });
-  for (let i = 0; i < 4; i++) curiosity.note(ws, "热门一点的问题", { source: "recall" });
-  const ranked = curiosity.gaps(ws);
-  assert.equal(ranked[0].display, "热门一点的问题");
+  curiosity.notice(ws, "Mesa", {});
+  const [once] = curiosity.noticings(ws);
+  for (let i = 0; i < 3; i++) curiosity.notice(ws, "Zink", {});
+  const many = curiosity.noticings(ws).find((n) => n.display === "Zink");
+  assert.ok(curiosity.pull(many) > curiosity.pull(once));
 });
 
-test("resolving records how it ended and stops proposing", () => {
+test("propose: always returns an array", () => {
+  // Returning null for "nothing" and an array for "something" makes callers
+  // test the shape instead of the length; one of them will get it wrong.
   const ws = freshWs();
-  curiosity.note(ws, "Turnip 是什么", { source: "recall" });
-  const r = curiosity.resolve(ws, "Turnip 是什么", "found", "安卓上的 Vulkan 驱动");
-  assert.equal(r.status, "resolved");
-  assert.equal(r.resolve_note, "安卓上的 Vulkan 驱动");
-  assert.equal(curiosity.gaps(ws).length, 0, "resolved gaps are not open");
-  assert.equal(curiosity.stats(ws).resolved, 1);
+  assert.ok(Array.isArray(curiosity.propose(ws)));
+  assert.equal(curiosity.propose(ws).length, 0);
 });
 
-test("dropped is a different ending than resolved", () => {
+test("propose: a single encounter is not enough to surface", () => {
   const ws = freshWs();
-  curiosity.note(ws, "某件不再重要的事", { source: "recall" });
-  curiosity.resolve(ws, "某件不再重要的事", "dropped");
+  curiosity.notice(ws, "Turnip", {});
+  assert.equal(curiosity.propose(ws, { minPull: 0.55 }).length, 0);
+});
+
+test("propose: repeated encounters surface it", () => {
+  const ws = freshWs();
+  for (let i = 0; i < 3; i++) curiosity.notice(ws, "Zink", {});
+  const picks = curiosity.propose(ws);
+  assert.equal(picks.length, 1, JSON.stringify(picks));
+  assert.equal(picks[0].display, "Zink");
+});
+
+test("propose: never surfaces more than one per wake", () => {
+  const ws = freshWs();
+  for (const n of ["Zink", "Mesa", "Vulkan", "Turnip"]) for (let i = 0; i < 3; i++) curiosity.notice(ws, n, {});
+  assert.equal(curiosity.propose(ws, { budget: 10 }).length, 1);
+});
+
+test("handOff: turns a noticing into a want", () => {
+  const ws = freshWs();
+  for (let i = 0; i < 3; i++) curiosity.notice(ws, "Zink", {});
+  const added = [];
+  const wants = {
+    add: (_ws, w) => {
+      added.push(w);
+      return { ok: true, id: "want-1" };
+    },
+  };
+  const r = curiosity.handOff(ws, "Zink", wants);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(added.length, 1);
+  assert.ok(added[0].what.includes("Zink"), JSON.stringify(added[0]));
+});
+
+test("handOff: refuses a cold one-off", () => {
+  // Handing over everything would make curiosity a to-do generator, which is
+  // the failure mode this design exists to avoid.
+  const ws = freshWs();
+  curiosity.notice(ws, "Turnip", {});
+  const wants = { add: () => ({ ok: true, id: "w" }) };
+  const r = curiosity.handOff(ws, "Turnip", wants);
+  assert.equal(r.ok, false);
+});
+
+test("handOff: the same noticing is not handed over twice", () => {
+  const ws = freshWs();
+  for (let i = 0; i < 3; i++) curiosity.notice(ws, "Zink", {});
+  const wants = { add: () => ({ ok: true, id: "want-1" }) };
+  assert.equal(curiosity.handOff(ws, "Zink", wants).ok, true);
+  assert.equal(curiosity.handOff(ws, "Zink", wants).ok, false);
+});
+
+// ── Losing interest ───────────────────────────────────────────────────────
+
+test("loseInterest: drops it and it stops surfacing", () => {
+  const ws = freshWs();
+  for (let i = 0; i < 3; i++) curiosity.notice(ws, "Zink", {});
+  assert.equal(curiosity.loseInterest(ws, "Zink").ok, true);
+  assert.equal(curiosity.propose(ws).length, 0);
+});
+
+test("loseInterest: a fragment finds the longer entry", () => {
+  const ws = freshWs();
+  curiosity.notice(ws, "为什么不直接烤 非用 2.45GHz", {});
+  assert.equal(curiosity.loseInterest(ws, "2.45GHz").ok, true);
+});
+
+test("loseInterest: an ambiguous fragment drops nothing", () => {
+  // Silently dropping two records because a fragment matched both is worse
+  // than refusing.
+  const ws = freshWs();
+  curiosity.notice(ws, "Vulkan 后端", {});
+  curiosity.notice(ws, "Vulkan 驱动", {});
+  assert.equal(curiosity.loseInterest(ws, "Vulkan").ok, false);
+  assert.equal(curiosity.noticings(ws).length, 2);
+});
+
+test("loseInterest: it is not a claim of understanding", () => {
+  // There is no "resolved" state on purpose. Stats must not report a learned
+  // count, because losing interest is not learning.
+  const ws = freshWs();
+  curiosity.notice(ws, "Zink", {});
+  curiosity.loseInterest(ws, "Zink");
   const st = curiosity.stats(ws);
-  assert.equal(st.dropped, 1);
-  assert.equal(st.resolved, 0, "giving up is not learning");
+  assert.equal(st.faded, 1);
+  assert.equal(st.open, 0);
+  assert.equal("resolved" in st, false, JSON.stringify(st));
 });
 
-test("re-encountering a resolved gap reopens it", () => {
+// ── Persistence ───────────────────────────────────────────────────────────
+
+test("state survives a reload", () => {
   const ws = freshWs();
-  curiosity.note(ws, "到底为什么", { source: "recall" });
-  curiosity.resolve(ws, "到底为什么", "found", "以为懂了");
-  const g = curiosity.note(ws, "到底为什么", { source: "recall" });
-  assert.equal(g.status, "open", "the answer did not stick");
-  assert.equal(g.times_encountered, 2);
+  for (let i = 0; i < 3; i++) curiosity.notice(ws, "Zink", {});
+  const again = curiosity.noticings(ws);
+  assert.equal(again.length, 1);
+  assert.equal(again[0].seen, 3);
 });
 
-test("propose returns at most the budget", () => {
+test("an empty workspace is not an error", () => {
   const ws = freshWs();
-  for (let i = 0; i < 5; i++) curiosity.note(ws, `问题编号${i}`, { source: "recall" });
-  assert.equal(curiosity.propose(ws, { budget: 1 }).length, 1);
-  assert.equal(curiosity.propose(ws, { budget: 0 }).length, 0);
+  assert.deepEqual(curiosity.noticings(ws), []);
+  assert.deepEqual(curiosity.propose(ws), []);
+  assert.equal(curiosity.stats(ws).open, 0);
 });
 
-test("propose records that it proposed", () => {
+test("trimming drops the weakest pull, not the oldest", () => {
+  // An old noticing that keeps coming back is the most alive thing in the
+  // file; the newest one-off is the least. Evicting by age would delete
+  // exactly the wrong entries.
   const ws = freshWs();
-  curiosity.note(ws, "被提过一次的问题", { source: "recall" });
-  curiosity.propose(ws);
-  const after = curiosity.gaps(ws)[0];
-  assert.equal(after.proposed_count, 1);
-  assert.ok(after.last_proposed_at, "timestamp is what lets a gap cool down");
-});
-
-test("the store survives a corrupt file", () => {
-  const ws = freshWs();
-  fs.writeFileSync(path.join(ws, "state", "curiosity.json"), "{not json", "utf8");
-  assert.doesNotThrow(() => curiosity.load(ws));
-  assert.equal(curiosity.gaps(ws).length, 0);
-  assert.ok(curiosity.note(ws, "坏文件之后还能写", { source: "recall" }));
-});
-
-// ── extractors ───────────────────────────────────────────────────────
-
-test("empty recall becomes a gap", () => {
-  const hits = extract.fromRecall({ params: { query: "某种作物" }, result: recallEmpty("某种作物") });
-  assert.equal(hits.length, 1);
-  assert.equal(hits[0].topic, "某种作物");
-  assert.equal(hits[0].domain, "knowledge");
-});
-
-test("a successful recall is not a gap", () => {
-  const hits = extract.fromRecall({ params: { query: "火锅" }, result: recallHit("火锅") });
-  assert.equal(hits.length, 0, "finding it means the shelf was not empty");
-});
-
-test("who_is on a stranger is a person gap", () => {
-  const hits = extract.fromWhoIs({
-    params: { name: "张三" },
-    result: { content: [{ type: "text", text: "不认识这个人，没记录。" }] },
-  });
-  assert.equal(hits.length, 1);
-  assert.equal(hits[0].domain, "person");
-  assert.match(hits[0].topic, /张三/);
-});
-
-test("numeric ids are not person gaps", () => {
-  const hits = extract.fromWhoIs({
-    params: { name: "1000000001" },
-    result: { content: [{ type: "text", text: "查不到" }] },
-  });
-  assert.equal(hits.length, 0);
-});
-
-test("explicit not-knowing becomes a gap", () => {
-  const hits = extract.fromQuestion("我不知道 Zink 是什么东西");
-  assert.equal(hits.length, 1);
-  assert.equal(hits[0].topic, "Zink");
-});
-
-test("meta not-knowing is refused", () => {
-  assert.equal(extract.fromQuestion("我不知道你在说什么").length, 0);
-  assert.equal(extract.fromQuestion("不知道该怎么办").length, 0);
-});
-
-test("a sentence carrying both still yields the honest half", () => {
-  const hits = extract.fromQuestion("我不知道你在说什么，但 Zink 我确实不知道");
-  const topics = hits.map((h) => h.topic);
-  assert.ok(topics.includes("Zink"), `expected Zink in ${JSON.stringify(topics)}`);
-  assert.ok(!topics.some((t) => t.includes("你在说什么")));
-});
-
-test("short search queries are refused as too ambiguous", () => {
-  assert.equal(extract.fromSearch({ params: { query: "天气" } }).length, 0);
-  assert.equal(extract.fromSearch({ params: { query: " 水稻 面积 下降" } }).length, 1);
-});
-
-test("browse picks latin terms and ignores urls", () => {
-  const hits = extract.fromBrowse({ text: "这期讲 Turnip 和 Zink，https://x.com/a" });
-  const topics = hits.map((h) => h.topic);
-  assert.ok(topics.includes("Turnip"));
-  assert.ok(!topics.some((t) => t.includes("https")));
-});
-
-test("browse respects already-known terms", () => {
-  const hits = extract.fromBrowse({ text: "Turnip 和 Zink", known: ["turnip"] });
-  assert.deepEqual(hits.map((h) => h.topic), ["Zink"]);
-});
-
-test("browse caps at two per scroll", () => {
-  const hits = extract.fromBrowse({ text: "Alpha Beta Gamma Delta Epsilon" });
-  assert.equal(hits.length, 2);
-});
-
-// ── end to end ───────────────────────────────────────────────────────
-
-test("extraction feeds the store and produces an injection-ready pick", () => {
-  const ws = freshWs();
-  for (const h of extract.fromRecall({ params: { query: "某种作物" }, result: recallEmpty("某种作物") })) {
-    curiosity.note(ws, h.topic, { source: "recall", domain: h.domain });
+  for (let i = 0; i < curiosity.CONSTANTS.MAX_NOTICINGS + 5; i++) {
+    curiosity.notice(ws, `filler${i}`, {});
   }
-  const pick = curiosity.propose(ws)[0];
-  assert.ok(pick);
-  assert.equal(pick.display, "某种作物");
-  assert.ok(pick.urgency > 0 && pick.urgency <= 1);
-  assert.ok(pick.sources.includes("recall"));
+  // Make one entry ancient but recurring.
+  for (let i = 0; i < 6; i++) curiosity.notice(ws, "filler0", {});
+  const open = curiosity.noticings(ws, { limit: 200 });
+  assert.ok(open.some((n) => n.topic === "filler0"), "the recurring entry was evicted");
 });

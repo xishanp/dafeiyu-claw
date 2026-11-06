@@ -70,6 +70,9 @@ workspace/state/*.json          结构化状态，一个文件一件事
 | `state/entities.json` | `entities.js` | 名字 → 记忆 |
 | `state/edges.json` | `edges.js` | 记忆 ↔ 记忆，带原因 |
 | `state/life-cursor.json` | `life-log.js` | 日记读到哪了 |
+| `state/compulsion.json` | `compulsion.js` | 同一类动作连续被选了几轮 |
+| `state/horizon.json` | `horizon.js` | 哪些方向碰过、哪些还是空白 |
+| `state/outcomes.json` | `outcome.js` | 做成 / 没做成，按意图分类 |
 | `state/probe.log` | 所有注入器 | 每条注入一行，只追加 |
 
 `deeds.json`、`effects.json`、`experience-pool.json` 目前有多个写入者，是已知
@@ -111,6 +114,63 @@ urgency 排序 ── 次数 0.42 / 新鲜 0.30 / 置信 0.28 / 未提过 0.08
 **为什么浏览来源默认关闭** —— 实测 29 条真实记录，触发 3 条，造出 4 个词，
 全部是它本来就认识的。一条假缺口的代价高于十条缺失：
 它会让整个清单被判定为噪声，然后连真的也不看了。
+
+### 为什么「出去逛」不能参与排序
+
+这一条值得单独写，因为第一版做错了，而且错法看起来很像勤快。
+
+早先的做法是把「出去逛」也做成候选，给一个价值分，和手上的事一起排队：
+
+```js
+// 错的做法
+{ kind: "horizon", value: habit.stuck ? 0.66 : 0.42 }
+{ kind: "wander",  value: habit.stuck ? 0.62 : 0.34 }
+```
+
+和一条 value 0.45 的想做的事放在一起，结果只有两种：
+
+- **0.66 > 0.45** → 永远在逛，手上的事一件也做不完
+- **0.42 < 0.45** → 永远不出去，只在旧念头里打转
+
+**这两种都不是决定，是算术。** 调参数只是在选择掉进哪个坑。
+
+真正的区分不是「哪个分高」，是**「手上到底有没有东西」**：
+
+```
+手上有事  → 做那件        （不提供方向，因为不需要）
+手上空了  → 给一个方向    （不给候选，因为没有可比的东西）
+```
+
+判断依据是存在性，不是分数。`decide()` 现在收一个 `whenEmpty` 参数，
+只在候选池为空时返回它。
+
+### 为什么「反复做同一件事」要自己报警
+
+连击计数一开始是**严格连续**的，遇到不同的就归零：
+
+```js
+// 旧
+for (let i = list.length - 1; i >= 0; i--) {
+  if (list[i].key !== key) break;
+  streak++;
+}
+```
+
+真实日志：
+
+```
+04:38  同一类动作 x4    ← 触发报警
+04:43  别的动作    x1    ← 报警唯一的建议：换个候选
+04:44  同一类动作  x1    ← 一换就归零，可以再攒四轮
+```
+
+**报-换-归零-再攒。** 检测器的唯一响应，恰好是它的重置条件。
+
+改成窗口内计数（最近 12 条里出现几次）之后，同一份历史从 `streak=1`
+变成 `streak=9`，降权才真正开始生效。
+
+判据不是「阈值要不要调」，是：**报警之后系统做的第一件事，会不会把计数清掉？**
+会，就等于没有这个机制。
 
 ### 为什么注入要排序
 
@@ -216,6 +276,9 @@ lose fields.
 | `state/entities.json` | `entities.js` | names → memories |
 | `state/edges.json` | `edges.js` | memory ↔ memory with a reason |
 | `state/life-cursor.json` | `life-log.js` | how far into the diary we have read |
+| `state/compulsion.json` | `compulsion.js` | how many wakes in a row picked the same kind |
+| `state/horizon.json` | `horizon.js` | which directions were touched, which are still blank |
+| `state/outcomes.json` | `outcome.js` | done / not done, keyed by intent |
 | `state/probe.log` | all injectors | one line per injection, append-only |
 
 `deeds.json`, `effects.json` and `experience-pool.json` currently have more than
@@ -260,6 +323,32 @@ all writes live in `curiosity.js`. This lets the extraction rules be fully unit-
 3 triggered, 4 terms minted, all four already known. One false gap costs more than
 ten missing ones: it gets the whole list classified as noise, and then the real ones
 stop being read too.
+
+### Why "go outside" cannot be a scored candidate
+
+The early design put "go wander" in the same candidate list as her own
+unfinished work, with a value, and let them compete. Against a want worth 0.45,
+only two outcomes exist: at 0.66 she is always wandering and never finishes
+anything; at 0.42 she never leaves and circles the same old idea.
+
+**Neither is a decision. Both are arithmetic.** Tuning the constant only
+switches which trap it falls into. The real distinction is not "which scores
+higher", it is "does she have anything in hand at all". Existence, not score.
+`decide()` takes a `whenEmpty` argument returned only when the pool is empty.
+
+### Why repetition has to announce itself
+
+The streak counter was initially strictly consecutive, resetting on any
+different pick. Real log: same action x4 (alarm), something else x1 (the
+alarm's only advice), same action x1 (counter reset, four more rounds).
+
+**Alarm, switch, reset, repeat.** The detector's only response was its own reset
+condition. Counting within a window turned the same history from `streak=1`
+into `streak=9`, which is where the weight decay finally started to bite.
+
+The question is not "should the threshold change". It is: after the alarm
+fires, does the first thing the system does clear the count? If yes, the
+mechanism does not exist.
 
 ### Why injection is ordered
 

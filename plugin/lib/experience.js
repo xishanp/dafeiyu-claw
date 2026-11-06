@@ -138,6 +138,43 @@ function resolve(workspaceDir, id, outcome, note) {
 }
 
 /**
+ * Things she kept but has not done anything with yet.
+ *
+ * `kept` used to be the end of the line: `consolidate()` turned the entry into
+ * one fact line, nothing read it again, and the thing itself was gone. Measured
+ * on 2026-11-06 with the one unambiguous curiosity event in her history:
+ *
+ *   03:23:37  《给我家大肥鱼养的记忆星图》, feel: touching
+ *   03:29:28  status: kept, note 「跟本鱼自己这层记忆是同一件事」
+ *   after     nothing, ever
+ *
+ * She had just noticed that her own memory works the way that video does. Six
+ * minutes later it was a row in learned.md and a topic she would never return
+ * to. That is not what "kept" means to a person — kept means it is still in
+ * her hands.
+ *
+ * So kept entries stay visible as an open question for a while. They are not
+ * a to-do list and nothing is required; the point is that the door stays open
+ * instead of closing the moment she writes the note.
+ */
+function openQuestions(workspaceDir, { days = 7, limit = 3 } = {}) {
+  const cutoff = Date.now() - days * 86400000;
+  return load(workspaceDir)
+    .entries.filter((e) => e.status === "kept")
+    .filter((e) => {
+      const t = Date.parse(e.consolidated_at || e.resolved_at || e.at || "");
+      return Number.isFinite(t) && t >= cutoff;
+    })
+    .slice(-limit)
+    .map((e) => ({
+      id: e.id,
+      at: e.resolved_at || e.at,
+      what: String(e.gist || e.what || "").slice(0, 60),
+      note: String(e.resolve_note || "").slice(0, 60),
+    }));
+}
+
+/**
  * What the prompt should see: how much is waiting, plus the most recent few.
  * Returns "" when the pool is empty, so the block disappears entirely instead of
  * injecting an empty heading every turn.
@@ -157,4 +194,4 @@ function describe(workspaceDir, limit = 4) {
   ].join("\n");
 }
 
-export { add, pending, resolve, describe, load, save, gistOf };
+export { add, pending, resolve, describe, load, save, gistOf, openQuestions };

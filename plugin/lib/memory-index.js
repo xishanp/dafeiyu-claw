@@ -1,6 +1,6 @@
 // Memory index over <workspace>/memory/**.md
 // Builds an in-memory inverted index, persisted to state/memory-index.json.
-// Handles Chinese via bigrams, so 「吃什么」 finds 「米饭」 through synonyms
+// Handles Chinese via bigrams, so 「吃什么」 finds 「白米饭」 through synonyms
 // and 「火锅」 finds 「火锅」 directly.
 
 import fs from "node:fs";

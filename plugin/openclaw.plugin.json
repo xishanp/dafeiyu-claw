@@ -63,7 +63,12 @@
       "recall_links",
       "sleep_review",
       "want_do",
-      "activity_state"
+      "activity_state",
+      "horizon_state",
+      "horizon_visit",
+      "curiosity_state",
+      "curiosity_want",
+      "curiosity_forget"
     ]
   },
   "hooks": {

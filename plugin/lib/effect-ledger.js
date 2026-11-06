@@ -171,11 +171,6 @@ export function all(workspaceDir) {
 }
 
 /** Entries whose `at` starts with the given YYYY-MM-DD (defaults to nothing). */
-export function onDay(workspaceDir, day) {
-  if (!day) return [];
-  return all(workspaceDir).filter((e) => String(e.at).startsWith(day));
-}
-
 /** The last N entries, newest last. */
 export function recent(workspaceDir, limit = 8) {
   return all(workspaceDir).slice(-Math.max(1, Math.min(MAX_ENTRIES, limit)));

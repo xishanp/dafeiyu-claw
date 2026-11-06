@@ -33,14 +33,30 @@ import * as douyin from "./lib/douyin-browse.js";
 import * as douyinLog from "./lib/douyin-log.js";
 import * as salience from "./lib/salience.js";
 import * as intent from "./lib/intent.js";
+import * as compulsion from "./lib/compulsion.js";
+// Missing until 2026-11-06.
+//
+// Seven call sites used this binding — the `horizon_state` and `horizon_visit`
+// tools plus the domain note in the browse hook — and nothing ever imported it.
+// `node --check` passed anyway, because undefined-variable use is not a syntax
+// error, and the plugin loaded fine because none of those paths had been
+// reached yet. The first time she called `horizon_state()` it would have thrown
+// ReferenceError into a tool result that reads like "the tool is broken".
+//
+// Found by grepping for a definition of every binding the new tools reference,
+// after already claiming the probes were "all reachable". Reachable code and
+// resolvable bindings are two different checks.
+import * as horizon from "./lib/horizon.js";
 import * as curiosity from "./lib/curiosity.js";
 import * as curiosityExtract from "./lib/curiosity-extract.js";
+import * as gaps from "./lib/gaps.js";
+import * as about from "./lib/about.js";
 import * as decide from "./lib/decide.js";
 import * as outcome from "./lib/outcome.js";
 import { resolveIdentity, parseTargetKey, resolveOnebotTargetKind } from "./lib/identity.js";
 import * as approvalStore from "./lib/approval.js";
 import { inferChannelFromTarget } from "./lib/outbound-target.js";
-import { sendWithGap, keyFromOnebotCall, isMediaMessage } from "./shared/onebot-media-gap.mjs";
+import { sendWithGap, keyFromOnebotCall, isMediaMessage } from "../shared/onebot-media-gap.mjs";
 
 // When was media last committed to a chat?
 //
@@ -556,7 +572,14 @@ function emotionDeltas(text, rel, opts = {}) {
     add("tsundere", 0.12);
     add("happy", 0.08);
   }
-  if (/(笨蛋|真傻|真蠢|好丑|垃圾|给我滚|闭嘴|好烦|滚开|废物|没用|讨厌你|你笨|好笨|真笨|蠢死)/.test(t)) {
+  // The words people actually use when annoyed were missing in the forms they
+  // use them. Measured 2026-11-06: 「你怎么这么笨啊，烦死了」 scored zero — `好烦`
+  // did not match `烦死了`, and `这么笨` did not match `好笨`. The only delta that
+  // survived was the flat +0.008 turn-end tiredness, so the prompt still called
+  // her calm. All of these are the same complaint, so they share one branch.
+  // `(?<!不)笨(?![蛋瓜拙重])` covers bare 笨 and 这么笨 while leaving 不笨 and 笨瓜
+  // (both affectionate) alone.
+  if (/(笨蛋|(?<!不)笨(?![蛋瓜拙重])|真傻|好傻|真蠢|好蠢|蠢死|好丑|垃圾|给我滚|滚开|闭嘴|废物|没用|讨厌你|真烦|好烦|烦死|烦人|别烦我)/.test(t)) {
     add("wronged", 0.18); add("happy", -0.12); add("down", 0.06); add("tsundere", 0.16);
   }
   if (/(哈哈|笑死|草|233|好乐|太乐|绷不住)/.test(t)) {
@@ -1013,33 +1036,143 @@ export default function register(api) {
   };
   const memoryCfg = { enabled: true, dailyLog: true, maxDailyLines: 500, ...(cfg.memory || {}) };
   const experienceCfg = { enabled: true, poolInPrompt: true, ...(cfg.experience || {}) };
-  // Curiosity: gaps she ran into and has not answered.
+    // Curiosity: names she met that she does not have an explanation for.
+    //
+    // `budget` is 1 by default and is a hard cap, not a probability. A wake
+    // proposes at most one name; two turns of "here are the things you do not
+    // understand" in a row is a to-do list, which is the failure this replaces.
+    //
+    // `sources` is a kill switch per input rather than one global toggle. The
+    // browse source fires constantly and the speech source almost never does;
+    // turning curiosity off wholesale to silence the noisy one would also throw
+    // away the precise one.
+    //
+    // `browse` is off by default: measured against 29 real video titles it
+    // offered `astra`, `deepseek`, `python`, `remotion` — every one of which
+    // she already knew. The switch stays so turning it on is a decision.
+  // Every tool that brings back text written by somebody else. This list is
+  // the whole point of the layer: curiosity about the world can only happen if
+  // she actually goes out into it, and "out" is not one website.
   //
-  // `budget` is 1 by default and is a hard cap, not a probability. A wake
-  // proposes at most one open question; two turns of "here are your unanswered
-  // questions" in a row is a to-do list, which is the failure this replaces.
+  // The extractor does not care which site it was; it cares whether the text
+  // was written by somebody else. A video title, a group chat, a Qzone post and
+  // a fetched page all qualify, and they qualify for the same reason: a name
+  // can arrive in them without anybody having asked for it.
+  // Names that are machine vocabulary rather than things in the world.
   //
-  // `sources` is a kill switch per input rather than one global toggle. The
-  // browse source fires constantly and the question source almost never does;
-  // turning curiosity off wholesale to silence the noisy one would also throw
-  // away the precise one.
+  // Measured 2026-11-06: fifteen noticings in one sitting read `source`,
+  // `web_fetch`, `external`, `chromium`, `managed-or-attach`, `lightpanda`,
+  // `screenshot`, and three UUID fragments. `source` had been "met" thirteen
+  // times and `screenshot` six, so both were ranked as questions she was
+  // circling. All of it came from browser status output — a description of the
+  // tool, not of anything she was reading.
+  //
+  // A UUID fragment is the clearest case: nobody is curious about
+  // `cae-4e1f-bb0b-fecb639ca049`. If an extractor cannot tell that from a thing
+  // in the world, it will fill the store with noise until it looks like it is
+  // working, and she will be handed questions about her own plumbing.
+  const MACHINE_WORDS = new Set([
+    "source", "external", "internal", "screenshot", "browser", "chromium",
+    "lightpanda", "managed", "attach", "web_fetch", "web_search", "tavily",
+    "tool", "toolName", "result", "error", "status", "started", "stopped",
+    "timeout", "timeoutMs", "localhost", "stdio", "cdp", "playwright",
+    "puppeteer", "websocket", "http", "https", "json", "yaml", "null",
+    "undefined", "true", "false", "profile", "session", "target", "node",
+    // HTML tag and attribute names. `div` reached the store on 2026-11-06 and
+    // `managed-or-attach` twenty minutes later: the browser tool returns the
+    // DOM as text, and the extractor cannot tell markup from prose. None of
+    // these is ever a thing in the world.
+    "div", "span", "body", "html", "head", "title", "script", "style",
+    "class", "href", "src", "alt", "img", "li", "ul", "br", "hr",
+    "table", "tr", "td", "meta", "link", "input", "form", "button",
+    "select", "option", "textarea", "label", "nav", "section", "article",
+    "header", "footer", "main", "aside", "canvas", "svg", "path",
+    "circle", "rect", "polygon", "iframe", "video", "audio", "script",
+    "property", "content", "rel", "type", "value", "name", "width", "height",
+    "muse", "aria", "role", "tabindex", "dataset", "className", "innerHTML",
+    // Compound tool-state phrases: `managed-or-attach`, `not-connected`,
+    // `headless-mode`. English hyphenated compounds never appear in the Chinese
+    // text she reads, so a lowercase ascii word-段 with a hyphen is code.
+    "managed-or-attach",
+  ]);
+
+  // `cae-4e1f-bb0b-fecb639ca049`, `c72f4d9`, `a434cb7-0e28-421e-95a9`.
+  //
+  // Three shapes, because browser ids arrive in all of them. The dash form is
+  // the one that bit: `cae-4e1f-bb0b-fecb639ca049` contains `c`, `e` and `a`,
+  // which are all valid hex digits, so a pure-hex test missed it. The real shape
+  // is "several short dash-separated groups made only of hex characters", which
+  // no word in either language has.
+  const HEX = "[0-9a-f]";
+  const ID_LIKE = new RegExp(
+    "^(?:" +
+      `${HEX}{6,}` +                       // c72f4d9
+      `|${HEX}{2,}(?:-${HEX}{2,}){1,}` +   // cae-4e1f-bb0b-fecb639ca049
+      ")$",
+    "i",
+  );
+
+  function isMachineName(s) {
+    const t = String(s || "").trim();
+    if (!t) return true;
+    if (MACHINE_WORDS.has(t)) return true;
+    if (MACHINE_WORDS.has(t.toLowerCase())) return true;
+    if (ID_LIKE.test(t)) return true;
+    // Underscore-separated identifiers (`web_fetch`, `tool_call`) are code, not
+    // prose. Chinese text never uses them.
+    if (/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/i.test(t)) return true;
+    // Lowercase ascii with hyphens and no spaces: `managed-or-attach`,
+    // `some-state-name`. Chinese prose does not produce this shape; browser
+    // status strings do. Mixed case and Chinese are untouched, so a real
+    // hyphenated product name still gets through.
+    if (/^[a-z][a-z0-9-]*[a-z0-9]$/.test(t) && t.includes("-") && t.length >= 8) return true;
+    // Short ascii tokens joined by `+`: `ad+ih`, `b9+103`.
+    //
+    // Both reached the store on 2026-11-06 — `ad+ih` at 04:30:46 and `b9+103`
+    // at 04:30:57 — during the same browse that produced the real ones
+    // (电饭煲发热原理, 电饭锅为什么知道饭熟). They are ad-slot and element ids
+    // from the page, and they passed every existing rule: too short for the
+    // hyphen rule, no underscore, not pure hex.
+    //
+    // The shape is the tell: a `+` between two very short ascii groups is how
+    // an id joins its parts. Chinese prose uses `＋`, or spaces, or nothing.
+    if (/^[a-z0-9]{1,6}(?:\+[a-z0-9]{1,6})+$/i.test(t)) return true;
+    return false;
+  }
+
+  const BROWSE_TOOLS = new RegExp(
+    "^(?:" +
+      [
+        "douyin_(?:act|record|plan|status)",
+        "qq_(?:recent|history|group_info|members|qzone|friends|groups|profile|whois|online)",
+        "web_fetch",
+        "browser",
+      ].join("|") +
+      ")$",
+  );
+
   const curiosityCfg = {
     enabled: true,
     budget: 1,
-    // `browse` is off by default because it was measured, not guessed. Over the
-    // 29 real douyin entries in state/douyin.json it fired on 3 videos and
-    // minted exactly `astra`, `deepseek`, `python`, `DeepSeek` — every one of
-    // them a term she already knows. A source whose entire output is false
-    // gaps teaches her that the gap list is noise, which is worse than having
-    // no list. Turn it on only after the extractor can tell a term from a
-    // product name.
-    sources: { recall: true, question: true, search: true, browse: false },
-    ...(cfg.curiosity || {}),
+    // Three sources, all real:
+    //   search   — she went looking on purpose (Tavily)
+    //   browse   — she went out and read something somebody else wrote
+    //   question — a name arrived in conversation
+    //
+    // `browse` used to be off, on the strength of a measurement: over 29 real
+    // douyin titles the old extractor minted `astra`, `deepseek`, `python` —
+    // every one of them already known. That measurement described the old
+    // extractor, not this one. Re-measured after the rewrite, the same 29 titles
+    // plus their comment threads yield one genuine unknown, which is the correct
+    // order of magnitude for a source that is mostly caption noise.
+    //
+    // `recall` used to sit here set to true while nothing read it. A flag that
+    // says "on" when no code consults it makes the configuration look finished
+    // when it is not, so it is gone rather than left as decoration.
     sources: {
-      recall: true,
       question: true,
       search: true,
-      browse: false,
+      browse: true,
       ...((cfg.curiosity && cfg.curiosity.sources) || {}),
     },
   };
@@ -1086,6 +1219,10 @@ export default function register(api) {
   // Kept separate from `proactive.ownerTargets`, which means "may be messaged
   // unprompted" — a different question from "should this line be spoken".
   const voiceCfg = {
+    // Declared but never consulted. Kept as a switch so the setting is honest:
+    // turning it off has to do something, or it is decoration that makes the
+    // configuration look more finished than it is.
+    enabled: true,
     suppressText: true,
     suppressWindowSeconds: 120,
     ownerTargets: [],
@@ -1149,15 +1286,41 @@ export default function register(api) {
     return PROBE_FALLBACK;
   }
 
-  function probe(tag, data) {
-    const line = `${new Date().toISOString()} ${tag} ${JSON.stringify(data)}\n`;
-    const target = probePath();
-    try {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.appendFileSync(target, line);
-      return;
-    } catch (err) {
-      probeErrors += 1;
+    // Keep the log readable, not just writable.
+    //
+    // `probe.log` reached 9 MB before anything was removed from it, and the cause
+    // was not one noisy tag: nothing ever trimmed the file. A log nobody can open
+    // stops being evidence, and `selfcheck` reads its samples from here, so bloat
+    // is a correctness problem rather than a housekeeping one.
+    //
+    // Rotate at 4 MB into a single `.1` — one generation is enough provenance to
+    // answer "did it fire before this change", which is the only question this
+    // file is ever asked. Overflow beyond that is dropped.
+    const PROBE_MAX_BYTES = 4 * 1024 * 1024;
+    let probeBytes = -1;
+
+    function rotateProbe(file) {
+      try {
+        if (probeBytes < 0) probeBytes = fs.existsSync(file) ? fs.statSync(file).size : 0;
+        if (probeBytes < PROBE_MAX_BYTES) return;
+        fs.renameSync(file, `${file}.1`);
+        probeBytes = 0;
+      } catch {
+        probeBytes = 0;
+      }
+    }
+
+    function probe(tag, data) {
+      const line = `${new Date().toISOString()} ${tag} ${JSON.stringify(data)}\n`;
+      const target = probePath();
+      try {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        rotateProbe(target);
+        fs.appendFileSync(target, line);
+        probeBytes = Math.max(0, probeBytes) + Buffer.byteLength(line);
+        return;
+      } catch (err) {
+        probeErrors += 1;
       // Announce the first failure and then every 100th, so a persistent
       // breakage is visible without flooding the console.
       if (probeErrors === 1 || probeErrors % 100 === 0) {
@@ -1190,6 +1353,34 @@ export default function register(api) {
     }
     if (!workspaceDir) return null;
     return { agentId, workspaceDir };
+  }
+
+  /**
+   * Other names the same person goes by.
+   *
+   * Read from USER.md's `称呼：Alice（用户）` line instead of hard-coded: a
+   * mapping this specific belongs to the person, not to the code.
+   *
+   * Exact-name matching is what lost all four existing person.md records. They
+   * were written as `about: Alice`; the live event carries `senderName: "用户"`;
+   * neither string contains the other, so `known(ws, "用户")` returned 0 of 4 and
+   * she would have started a second, parallel memory of the same man.
+   *
+   * Returns `[]` on any failure, which degrades to exact matching.
+   */
+  function personAliases(workspaceDir) {
+    try {
+      const md = fs.readFileSync(path.join(workspaceDir, "USER.md"), "utf8");
+      const m = /称呼[:：]\s*([^\n]+)/.exec(md);
+      if (!m) return [];
+      return m[1]
+        .split(/[（）()、,，/]+/)
+        .map((x) => x.trim())
+        .filter((x) => x && x !== "称呼")
+        .slice(0, 6);
+    } catch {
+      return [];
+    }
   }
 
   // -------- emotion storage --------
@@ -1537,7 +1728,8 @@ export default function register(api) {
             if (lead) {
               parts.push(
                 `【这会儿的劲头】${lead.text}。\n` +
-                `想干点什么就去干——画一张、出去逛逛、翻翻东西，都行。\n` +
+                `想干点什么就去干——去查点什么、翻翻东西、出去逛逛，都行。\n` +
+                `画图放最后：它太容易变成顺手就画一张，画完又没什么可说的。\n` +
                 `不是非得干，发呆也可以；只是别干坐着空过。`,
               );
             }
@@ -1561,6 +1753,15 @@ export default function register(api) {
       }
       const tp = topics.describeTopics(target.workspaceDir);
       if (tp) parts.push(tp);
+      // What this person has said about themselves. A preference nobody quotes
+      // back is a preference she does not have — `remember_about` has written
+      // person.md all along, and nothing in the prompt ever showed it.
+      try {
+        const said = about.describe(target.workspaceDir, id.senderName || null, {
+          aliases: personAliases(target.workspaceDir),
+        });
+        if (said) parts.push(said);
+      } catch { /* about is optional */ }
       // Quoting a near-stranger's words back is creepy, not warm. The ledger
       // gates itself on familiarity, so this is safe to call unconditionally.
       try {
@@ -1616,6 +1817,42 @@ export default function register(api) {
       }
     } catch (err) {
       api.logger?.warn?.(`dafeiyu-core: experience inject failed: ${err}`);
+    }
+
+    // Kept, useful, and unfinished.
+    //
+    // This is the third state the pool was missing. `pending` asks to be judged
+    // and `想明白的事` is the settled result, but between them there was nowhere
+    // for "I kept this and it is still in my hands". `kept` fell straight into
+    // the fact list and stopped existing as a thing she could return to.
+    //
+    // The concrete case: 2026-11-06 03:23 she kept 《给我家大肥鱼养的记忆星图》
+    // with the note 「跟本鱼自己这层记忆是同一件事」— her own memory works the way
+    // that video does — and by 03:29 it was a distilled line with no way back.
+    //
+    // No instruction attached on purpose. The block states what is on the table
+    // and when it was picked up; whether anything comes of it is hers to decide,
+    // and "nothing, ever" is a legitimate outcome.
+    try {
+      if (experienceCfg.enabled && experienceCfg.poolInPrompt) {
+        const open = experience.openQuestions(target.workspaceDir, { days: 7, limit: 3 });
+        if (open.length) {
+          const lines = open.map((e) => {
+            const when = String(e.at || "").slice(5, 10);
+            return `  · ${when} ${e.what}${e.note ? `（${e.note}）` : ""}`;
+          });
+          parts.push(
+            [
+              `【还挂着的】${open.length} 件`,
+              ...lines,
+              "这些是你觉得有意思、留下来了的。不是待办，不催你。",
+            ].join("\n"),
+          );
+          probe("open-questions-inject", { count: open.length });
+        }
+      }
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: open questions inject failed: ${err}`);
     }
 
     // What has already been thought through, as opposed to what is still
@@ -1809,40 +2046,6 @@ export default function register(api) {
     // One line, no instruction. The three headings differ by what actually
     // distinguishes the cases — how often she hit it, and whether she has ever
     // looked. "查一下" would turn a question into an assignment; the whole
-    // point of recording the encounter count is that the count itself is the
-    // pressure, and stating it is enough.
-    if (curiosityCfg.enabled && !autonomyWillAct) {
-      try {
-        const pick = curiosity.propose(target.workspaceDir, {
-          budget: curiosityCfg.budget,
-        })[0];
-        if (pick) {
-          const times = Number(pick.times_encountered ?? 1);
-          const why =
-            pick.sources.includes("recall") && times >= 2
-              ? `这事你撞到过 ${times} 次，每次都没想起来。`
-              : pick.sources.includes("question")
-                ? `你自己说过不知道。`
-                : pick.sources.includes("search")
-                  ? `你搜过，没搜到点子上。`
-                  : `你碰到过，没往下想。`;
-          parts.push(`【一直没弄明白的一件事】${pick.display}\n　${why}`);
-          probe("curiosity-inject", {
-            topic: pick.topic,
-            times,
-            urgency: Number(pick.urgency.toFixed(3)),
-            sources: pick.sources.join("+"),
-          });
-        } else {
-          probe("curiosity-inject-empty", {});
-        }
-      } catch (err) {
-        api.logger?.warn?.(`dafeiyu-core: curiosity inject failed: ${err}`);
-      }
-    } else if (autonomyWillAct) {
-      probe("curiosity-inject-skipped", { because: "autonomy states it" });
-    }
-
     // What has actually been MADE, as opposed to said. Injected only on
     // proactive turns (no chat identity = nobody is talking right now), because
     // that is the only moment the answer changes anything: mid-conversation the
@@ -1996,7 +2199,20 @@ export default function register(api) {
           // grounded in something that was actually written down.
           let phase = "steady";
           try {
-            phase = self.load(target.workspaceDir)?.phase || "steady";
+            phase = selfState.load(target.workspaceDir)?.phase || "steady";
+            // Was `self.load(...)`. `self` is not — and never was — an imported
+            // binding; the module is `selfState` (line 24). Every wake threw
+            // ReferenceError here, the `catch` below swallowed it, and `phase`
+            // silently stayed at its default `steady`.
+            //
+            // Measured 2026-11-06: `state/self.json` says `phase: productive`,
+            // and the decision code has never once seen it. `decide()` has a
+            // branch that only fires in `dormant`, so the whole phase dimension
+            // was dead — including the wander exemption fixed earlier today.
+            //
+            // The catch is correct to exist (a missing self.json is normal on a
+            // first run). The bug is that it made a permanent typo look like a
+            // routine first-run condition, which is why nothing ever reported it.
           } catch { /* unknown phase behaves as steady */ }
 
           const action = decide.decide(ranked.do, {
@@ -2012,6 +2228,33 @@ export default function register(api) {
             maxPerDay: autonomyCfg.maxPerDay,
             quietStartHour: autonomyCfg.quietStartHour,
             quietEndHour: autonomyCfg.quietEndHour,
+            // Where to go when there is nothing to do.
+            //
+            // Resolved here rather than ranked as a candidate, because a blank
+            // direction has no score that would be honest. This is the floor
+            // under an empty wake: not a task that won a competition, just the
+            // observation that there are ten directions she has never touched.
+            //
+            // `nextBlank` returns null only when every domain is covered, which
+            // is the one case where rest really is the right answer.
+            whenEmpty: (() => {
+              try {
+                const blank = horizon.nextBlank(target.workspaceDir);
+                if (!blank) return null;
+                const hist = horizon.history(target.workspaceDir, 3);
+                return {
+                  id: `horizon:${blank.id}`,
+                  kind: "horizon",
+                  title: `去碰一下「${blank.label}」`,
+                  serves: "world_knowledge",
+                  source: "novelty",
+                  basis: hist.total === 0
+                    ? `这一类你一条都没记过（${Object.keys(horizon.DOMAINS).length} 个方向里，你只碰过 1 个）`
+                    : `这一类你一条都没记过（已经出去碰过 ${hist.total} 次）`,
+                  detail: { domain: blank.id, label: blank.label, probe: blank.probe },
+                };
+              } catch { return null; }
+            })(),
           });
 
           // Only `do` earns an instruction. Every other action states, in the
@@ -2047,25 +2290,77 @@ export default function register(api) {
                 api.logger?.warn?.(`dafeiyu-core: wants.touch failed: ${err}`);
               }
             }
-            line =
-              `\n手边这件事，你自己掂量要不要做：${top.title}` +
-              `\n　为什么想到它：${top.basis}` +
-              `\n想做就去，不想做就算了 —— 这一轮不做什么也不算错。`;
-            // A curiosity candidate needs one extra pointer, because its whole
-            // point is that she does not already know how to close it. The
-            // generic line sends her at a thing to do; this one sends her at a
-            // thing to find out, and the difference is a tool she has to be told
-            // about exactly once.
+
+            // Record the streak for the next wake.
             //
-            // Naming both tools matters: `curiosity_state` is how she sees the
-            // whole list, `curiosity_resolve` is how the question stops being
-            // asked. Only naming the second would make the first look like a
-            // formality; only naming the first leaves her with no way to say
-            // she found out.
+            // Only `do` earns this, for the same reason `wants.touch()` lives
+            // here: a candidate that lost the ranking was not picked up, and
+            // counting it would report a streak she never had. Silent failure
+            // is acceptable — a missing history entry costs one weak signal,
+            // while throwing here would cost the whole turn.
+            try {
+              const r = compulsion.recordPick(target.workspaceDir, top.id);
+              probe("compulsion-pick", { id: top.id, key: r.key, streak: r.streak });
+            } catch { /* history is diagnostic, never load-bearing */ }
+
+            // Wandering has its own line. She is not being pointed at a task;
+            // she is being told the world is open and there is nothing due.
+            //
+            // Measured: the generic 「手边这件事」 phrasing made wandering read
+            // like an assignment, and an assignment on a timer is the thing
+            // this whole module exists to not be.
+            if (top.kind === "wander") {
+              line =
+                `\n这轮没别的。${top.basis}。` +
+                `\n想出去就出去——翻翻贴吧、刷刷抖音，多刷几条，或者翻个网页。` +
+                `\n刷到自己就想多看一眼的那种，就多待一会儿；什么也没有，也正常。`;
+            } else if (top.kind === "horizon") {
+              // A blank direction needs more than a title. She has to be able to
+              // tell this apart from a task assigned to her, and the difference
+              // is that a direction has no deliverable: there is nothing to hand
+              // in, and finding it boring is a complete outcome.
+              //
+              // The count is the load-bearing part. 「你的记录里一条都没有」 is a fact
+              // about her own writing that she cannot see by remembering, because
+              // she wakes up with no memory of last turn. Without the number this
+              // reads as one more suggestion; with it, it is a hole in a map.
+              line =
+                `\n有个方向，你的记录里一条都没有：${top.detail?.label || top.title}。` +
+                `\n　${top.detail?.probe || ""}` +
+                `\n不是任务，也没有要交的东西。去搜一下、刷一下、拆开一个东西看看都行，` +
+                `\n碰到什么记一句；觉得没意思就换一个方向，那也是完整的一轮。`;
+            } else {
+              line =
+                `\n手边这件事，你自己掂量要不要做：${top.title}` +
+                `\n　为什么想到它：${top.basis}` +
+                `\n想做就去，不想做就算了 —— 这一轮不做什么也不算错。`;
+            }
+            // A curiosity candidate needs one extra pointer, because its whole
+            // point is that she does not already know where to look. The generic
+            // line sends her at a thing to do; this one sends her at a thing to
+            // find out.
+            //
+            // There is deliberately no "record that you understood it" step
+            // here. Understanding is not a claim she can file — once she has
+            // looked, the thing stops pulling on its own. Offering a closing
+            // tool was the previous design, and it made her close entries
+            // instead of reading them. If she decides she no longer cares, the
+            // way out is `curiosity_forget`.
             if (top.kind === "curiosity") {
+              // What "doing something about it" means depends on the gap. A
+              // dangling name is looked up; a question he asked and nobody answered
+              // is asked back, because a search engine does not know why his
+              // messages are not arriving. Sending every gap to Tavily is the same
+              // flattening that made the old pool useless.
+              const gk = top.detail?.gapKind;
+              const how =
+                gk === "mismatch" ? `\n想知道就问一句，别当成质问——是你自己前后接不上，不是他做错了。`
+                : gk === "question" ? `\n这条可以自己查（Tavily、翻网页），也可以直接问他。问他对你来说更快。`
+                : `\n想知道这条到底是什么，就去查（Tavily 搜一下、翻网页都行）。`;
               line +=
-                `\n查明白了就记一笔（curiosity_resolve，topic 用「${top.detail?.topic ?? ""}」）；` +
-                `想知道还有什么没弄明白的，看 curiosity_state。`;
+                how +
+                `\n处理完不用记「我懂了」——它自己就不拉你了。` +
+                `\n真不想知道，就 curiosity_forget(topic 用「${top.detail?.topic ?? ""}」) 放掉。`;
             }
             // An experience candidate is already self-closing: resolving it now
             // records its own outcome (see experience_resolve). Only the other
@@ -2081,7 +2376,46 @@ export default function register(api) {
               `\n本来可以${top.title}，但${action.reason === decide.GATES.QUIET_HOURS ? "现在这个点不合适" : "刚说过话没多久"}。` +
               `\n这轮先放着。`;
           } else if (action.kind === "rest") {
-            line = `\n这轮没什么值得动的。歇着就行，不用硬找事做。`;
+              // The loop that was missing. A heartbeat with an empty queue used
+              // to say only "rest" — which is true, and which also ends the turn.
+              // She has QQ groups, douyin and a browser; going out to look is
+              // something she can do on a wake with nothing else in hand, and it
+              // is the only way fresh material enters the pool at all. Without
+              // this line the pool can only shrink: a name has to be encountered
+              // while reading, and if she never reads, she never encounters.
+              //
+              // Phrased as permission, not instruction. "Go explore" on a timer
+              // is a quota; "you could go look" is an option, and resting stays a
+              // legitimate answer.
+              //
+              // The last line matters as much as the first: browsing that leaves
+              // nothing behind is indistinguishable from not having browsed, and
+              // she is the one who decides whether anything was worth keeping.
+                // Only invite her out when there is genuinely nothing in hand.
+                // When a noticing is about to be surfaced below, sending her off
+                // to browse first would be an odd instruction: she has something
+                // specific she could look into, and wandering is the fallback for
+                // having nothing, not a default activity.
+                //
+                // Reading the store here rather than threading a flag through is
+                // deliberate: the curiosity block runs afterwards and would
+                // otherwise have to duplicate the pick, and two sources of truth
+                // for "is there something" drift apart.
+                let pending = [];
+                try {
+                  pending = curiosity.propose(target.workspaceDir, {
+                    budget: curiosityCfg.budget,
+                  });
+                } catch { /* an unreadable store means nothing to offer */ }
+
+                if (pending.length) {
+                  line = `\n这轮没有别的事等着你。`;
+                } else {
+                  line =
+                    `\n这轮没什么等着你做的。` +
+                    `\n想出去看看就出去——翻翻群、刷刷抖音、翻个网页，随便哪样。` +
+                    `\n看到什么不常见的，记一句；什么也没有，就歇着，这也不算白过。`;
+                }
           } else {
             line = `\n有一件事你之前想做（${top.title}），这回先不做了。`;
           }
@@ -2103,6 +2437,57 @@ export default function register(api) {
       } catch (err) {
         probe("autonomy-inject-error", { message: String(err?.message || err) });
       }
+
+    // What she has noticed and not explained. Runs only when the autonomy block
+    // above did not already claim the turn: two offers in one wake means she
+    // answers neither well. This test has to sit after `autonomyWillAct` is
+    // assigned — it was previously placed above that assignment, where the flag
+    // was still false, so the guard never engaged and curiosity injected even on
+    // wakes that had already been given something to do.
+    if (curiosityCfg.enabled && !autonomyWillAct) {
+      try {
+        const picks = curiosity.propose(target.workspaceDir, {
+          budget: curiosityCfg.budget,
+        });
+        const pick = picks && picks.length ? picks[0] : null;
+        if (pick) {
+          // What to offer depends on what kind of gap it is. One wording served all
+          // of them before, because all noticings were names. A question nobody
+          // answered and a contradiction about a person are not "a name you have
+          // seen"; describing them that way would be the system misreporting its
+          // own state in her voice.
+          //
+          // None of these lines claim she does not know something. The filter
+          // compares against her diary, and a diary is not a vocabulary: `linux`
+          // is absent from her notes and she knows exactly what it is.
+          let line = "";
+          if (pick.kind === "mismatch") {
+            line = `【对不上的一句话】${pick.display}\n　${pick.reasons?.[0] || "跟之前说的不一样"}。\n　不是要你质问，只是这一前一后接不上。想弄明白就问一句，不想问也没关系。`;
+          } else if (pick.kind === "question") {
+            line = `【问了没答的】${pick.display}\n　这句话没人回答过。\n　要是你也想知道，就去查，或者直接问回去。`;
+          } else {
+            const how =
+              pick.seen >= 3 ? `碰上过 ${pick.seen} 次`
+              : pick.seen === 2 ? "碰上过两次"
+              : "碰到过一次";
+            line = `【过眼的一个名字】${pick.display}\n　${how}，周围没有谁解释过它。\n　如果你本来就知道，忽略这条即可；不知道、又想知道，就去查。`;
+          }
+          parts.push(line);
+          probe("curiosity-inject", {
+            topic: pick.topic,
+            seen: pick.seen,
+            pull: Number(curiosity.pull(pick).toFixed(3)),
+          });
+        } else {
+          probe("curiosity-inject-empty", {});
+        }
+      } catch (err) {
+        api.logger?.warn?.(`dafeiyu-core: curiosity inject failed: ${err}`);
+      }
+    } else if (autonomyWillAct) {
+      probe("curiosity-inject-skipped", { because: "autonomy states it" });
+    }
+
     }
 
     // COGNITION.md is not on the Gateway's bootstrap whitelist
@@ -2129,6 +2514,79 @@ export default function register(api) {
       }
     } catch (err) {
       api.logger?.warn?.(`dafeiyu-core: cognition inject failed: ${err}`);
+    }
+
+    // Is she going round in circles?
+    //
+    // This is the one block that exists purely because of a measured failure.
+    // 2026-11-06: fifty-three versions of one question, twelve of them after she
+    // had written the conclusion on version forty-one. Her diary named it
+    // herself — 「我不是在往前挖，是在同一个地方反复摔」 — and nothing in the
+    // system could act on her own observation.
+    //
+    // Deliberately placed after COGNITION.md, because COGNITION is the rules and
+    // this is the reading of her current state against those rules. Rules first,
+    // then the fact.
+    //
+    // Phrased as an observation with an offer, never as an instruction to stop.
+    // She is the one who decides what counts as done; a system that declares her
+    // work finished for her is the same mistake as a system that assigns her
+    // work. What it can do honestly is show her the count she is not seeing.
+    try {
+      const habit = compulsion.check(target.workspaceDir);
+
+      // A single want picked up five or more times, named explicitly.
+      //
+      // The streak counter above only knows "the same *kind* of move won several
+      // wakes". That is the right signal for a loop across different candidates,
+      // but it cannot say WHICH thing she is circling — and the thing itself is
+      // usually one want, reopened, with no finish line.
+      //
+      // Measured 2026-11-06: the corridor want ran from 11-04 to 11-06 across
+      // fifty-four versions. `streak` saw "want" as a category; nothing ever
+      // said 「这一条你已经做了五十四次」 because nothing counted per-want.
+      //
+      // Five is the owner's number and it matches where the observed cases were
+      // already stuck. The wording states the count and offers the two exits; it
+      // does not declare the work finished, because that is hers to say.
+      const worn = (() => {
+        try {
+          const rows = wants.open(target.workspaceDir)
+            .filter((w) => Number(w.attempts || 0) >= 5)
+            .sort((a, b) => Number(b.attempts) - Number(a.attempts));
+          return rows[0] || null;
+        } catch { return null; }
+      })();
+
+      if (habit.stuck || worn) {
+        const streakLine = habit.streak.length >= compulsion.STREAK_ALARM
+          ? `\n最近 ${habit.streak.length} 轮选的都是同一类事。`
+          : "";
+        const wornLine = worn
+          ? `\n「${String(worn.what || "").slice(0, 50)}」这一条，你已经动过 ${worn.attempts} 次了。`
+          : "";
+        const head = habit.stuck ? habit.because + "。" : "";
+        parts.push(
+          [
+            "【数一下就看出来了】",
+            head + streakLine + wornLine,
+            "\n不是说你该停。只是同一件事如果已经答完了，再开一版也不会更真；",
+            "如果它本来就没有终点（比如把画面调得更像样），那它哪一版停都算数。",
+            "\n真到这儿了，就把手上那条收掉（want_do(done=…) / goal_close）；",
+            "想换别的也行，换掉不是半途而废。",
+          ].join("\n"),
+        );
+        probe("compulsion-inject", {
+          streak: habit.streak.length,
+          versions: habit.versions.count,
+          newest: habit.versions.newest,
+          worn: worn ? { id: worn.id, attempts: worn.attempts } : null,
+        });
+      } else {
+        probe("compulsion-inject-empty", {});
+      }
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: compulsion inject failed: ${err}`);
     }
 
     // The Gateway only injects a date, never the hour. Without this the
@@ -2218,11 +2676,40 @@ export default function register(api) {
       // character to read on purpose, just not crowding every prompt.
       const entries = body.split(/\n(?=- )/).map((s) => s.trim()).filter(Boolean);
       const tail = entries.slice(-12);
+
+      // MEASURED 2026-11-06, and it is the single most direct cause of the loop.
+      //
+      // Of the newest twelve entries, nine began 「第 N 版」 — 31, 33, 33, 34, 42,
+      // 48, 49, 51, 52. So on every wake she was shown nine consecutive lines
+      // saying "this is version fifty-one, version fifty-two", immediately after
+      // COGNITION.md told her 「手上有没做完的 → 接着做，别重新开一个」. That is
+      // not a hint that she is in a loop; it is an instruction to continue one.
+      //
+      // The fix is not to hide the entries. They are hers, she wrote them, and a
+      // self-record that gets filtered is no longer a self-record. What changes
+      // is that the streak is now *named* next to them. Naming a thing is the
+      // difference between "I am deeply engaged" and "I am on the fifty-third
+      // pass of a question I already answered on the forty-first".
+      let note = "";
+      try {
+        const v = compulsion.versionRun(workspaceDir);
+        if (v.count >= compulsion.VERSION_ALARM) {
+          note = [
+            `\n【数一下就看见了】上面这 ${tail.length} 条里，${v.count} 条带着版次，`,
+            `最新一条是第 ${v.newest} 版。`,
+            `\n版次是往前走的记号，但它也说明这是同一件事的第 ${v.newest} 回。`,
+            `\n不在叫你停。只是如果这一版你已经在回答同一句话，那它大概完了；`,
+            `真完了就不用再开一版，换别的也不会有人说你半途而废。`,
+          ].join("");
+        }
+      } catch { /* a missing counter must not swallow her own writing */ }
+
       return [
         "【你自己写下的】",
         ...tail,
+        note,
         "这些是你自己写的，不是别人给的。想添新的一句就用 note_self。",
-      ].join("\n");
+      ].filter(Boolean).join("\n");
     } catch {
       return "";
     }
@@ -2249,8 +2736,25 @@ export default function register(api) {
     try {
       const known = proactive.resolveTargetConfig(proactiveCfg, String(dest));
       if (!known) return;
-      proactive.recordSpoken(target.workspaceDir, known.key, text, proactiveCfg);
-      probe("message-sent-recorded", { target: known.key, channel: known.channel });
+      // Is this a spontaneous opening, or an answer?
+      //
+      // `proactive.isReplyWindow` was written to answer exactly this, kept a
+      // 30-minute window, and explained why counting every reply as proactive
+      // breaks the moment a real channel is attached — and was called by nobody.
+      // So `recordSpoken` ran on every outbound line, including a reply two
+      // seconds after someone spoke: it inflated `spoke_today`, moved
+      // `last_spoke_at` forward mid-conversation, and left the pacing counters
+      // describing a machine talking to itself.
+      //
+      // Replying is not opening. Only record it as proactive when the other side
+      // has been quiet longer than the reply window.
+      const win = proactive.isReplyWindow(target.workspaceDir, known.key, proactiveCfg);
+      if (win.inWindow) {
+        probe("message-sent-reply", { target: known.key, waitedMin: Math.round(win.waitedMin ?? 0) });
+      } else {
+        proactive.recordSpoken(target.workspaceDir, known.key, text, proactiveCfg);
+        probe("message-sent-recorded", { target: known.key, channel: known.channel });
+      }
 
       // Speaking on her own initiative goes through `message`, which fires
       // `message_sent` — not `reply_payload_sending`. Without this the diary
@@ -2313,6 +2817,7 @@ export default function register(api) {
   // Scoped by chat and by a short window, and consumed once, so a genuine
   // follow-up a minute later is not swallowed.
   api.on("reply_payload_sending", (event, ctx) => {
+    if (!voiceCfg.enabled) return;
     if (!voiceCfg.suppressText) return;
     const target = resolveTarget(ctx);
     if (!target) return;
@@ -2528,39 +3033,54 @@ export default function register(api) {
       api.logger?.warn?.(`dafeiyu-core: life log (in) failed: ${err}`);
     }
 
-    // Curiosity source 2 of 4: she said out loud that she does not know
-    // something. This is the highest-precision signal we get, and it only
-    // exists at this hook — the tool hooks never see her prose.
+    // What this person just said about themselves.
     //
-    // Note the asymmetry with every other source: this one records what *she*
-    // admitted, not what the world showed her. It must therefore stay silent
-    // when the sentence is ambiguous, which is why the extractor carries its
-    // own false-positive list rather than trusting the marker alone ("我不
-    // 知道你在说什么" is not a question about the world).
-    if (curiosityCfg.enabled) {
+    // `remember_about` has existed all along and `memory/facts/person.md` already
+    // holds real lines. What never happened is anyone calling it: measured
+    // 2026-11-06, three preference statements went through complete turns and
+    // produced diary lines, pool entries and a 「最近聊到的」 line, and person.md
+    // stayed unchanged. A preference is said in passing, mid-conversation, and
+    // nothing in the loop ever stopped and treated it as being about him.
+    //
+    // Written here, next to the daily log, because both are "what he said" and
+    // splitting them across two hooks is how one of them gets forgotten.
+    if (memoryCfg.enabled) {
       try {
-        for (const hit of curiosityExtract.fromQuestion(text, {
-          context: String(event?.senderName || "").slice(0, 40) || null,
-        })) {
-          const gap = curiosity.note(target.workspaceDir, hit.topic, {
-            source: "question",
-            domain: hit.domain,
-            context: hit.context,
-            display: hit.topic,
-          });
-          if (gap) probe("curiosity-gap", { via: "question", topic: gap.topic });
+        const said = about.read(text);
+        if (said) {
+          // Store under the canonical name from USER.md, not the display name.
+          //
+          // These diverged immediately: the live event carries `senderName: "用户"`
+          // while all four existing person.md records say `about: Alice`. Writing the
+          // display name would have split one man into two owners on the very first
+          // reply — `known()` filters on this field, so his old preferences would have
+          // stopped matching his new ones. The alias list makes reading tolerant; this
+          // makes writing consistent, and both are needed or the file drifts anyway.
+          const aliases = personAliases(target.workspaceDir);
+          const display = String(event?.senderName || "").trim();
+          const who = aliases[0] || display || null;
+          // Importance follows how durable the statement is: an allergy outlives a
+          // favourite drink, but both matter more than a habit mentioned once.
+          const imp = said.tag === "过敏" ? 0.9 : said.tag === "身份" ? 0.85 : said.tag === "讨厌" ? 0.75 : said.tag === "喜欢" ? 0.7 : 0.55;
+          const r = about.remember(target.workspaceDir, { text: said.text, about: who, tag: said.tag, importance: imp });
+          probe("about", { tag: said.tag, about: who, stored: Boolean(r.ok), reason: r.reason || null });
         }
       } catch (err) {
-        api.logger?.warn?.(`dafeiyu-core: curiosity (question) failed: ${err}`);
+        api.logger?.warn?.(`dafeiyu-core: about failed: ${err}`);
       }
     }
 
+
+
     // Relations first: how this person makes us feel depends on who they are.
-    let id = null;    let rel = null;
-    let burst = 0;
+    // A first message from a stranger and a first message from someone we have
+    // known for months are the same words and different events.
+    let burst = null;
+    let id = null;
+    let rel = null;
     try {
       id = identity(ctx, event);
-      if (id.personKey || id.groupKey) {
+      if (id && (id.personKey || id.groupKey)) {
         const burstKey = id.personKey || id.groupKey;
         burst = recentBurst(target.workspaceDir, burstKey);
         noteTick(target.workspaceDir, burstKey);
@@ -2569,6 +3089,98 @@ export default function register(api) {
       }
     } catch (err) {
       api.logger?.warn?.(`dafeiyu-core: identity lookup failed: ${err}`);
+    }
+
+    // Gaps: what in this message does not add up?
+    //
+    // This replaces an extractor that only ever found proper names. Measured
+    // 2026-11-06 against 113 lines of her own diary: 19 were real questions and it
+    // extracted none, because 「为什么我给你发消息你却收不到呢」 contains no noun.
+    // A dictionary lookup and a thing that bothers you are different events.
+    //
+    // Three kinds, ordered by how much they should pull:
+    //   mismatch — he said the opposite of something he said before. Rarest, most
+    //              worth asking, and the only one that is *about* a person.
+    //   question — a question the text never answers.
+    //   dangling — a name appears and nobody explains it. This is the old source.
+    //
+    // Sits after `identity` because a mismatch needs this person's earlier lines,
+    // and those are keyed by who is speaking.
+    if (curiosityCfg.enabled) {
+      try {
+        // The diary is keyed by the speaker's name, not by the relation key:
+        // `## 06:56 · 用户` is what `noteTurn` writes, because a day file should be
+        // readable. Asking for `person:onebot:12345` against that file returns
+        // nothing, which silently disabled mismatch detection — measured: the
+        // prior list came back empty on every message while the diary held the
+        // line all along.
+        const who = String(event?.senderName || id?.senderName || "").trim() || null;
+        const prior = who ? lifeLog.recentSaidBy(target.workspaceDir, who, 60) : [];
+        // `speaker: "other"` because `text` is an incoming message, not her diary.
+        //
+        // Same function, two callers with opposite readings of a question. Without
+        // this flag every 「你在干嘛」「你是不是…」 from anybody became something she was
+        // supposed to go investigate, weighted 0.7 and ranked near the top of every
+        // wake.
+        const found = gaps.find(text, { prior, max: 3, speaker: "other" });
+        if (found.length) {
+          let known = [];
+          try {
+            // `known` must describe what she knew BEFORE this message: the daily
+            // log is written a few lines above, so an index built now already
+            // contains the very words being tested, and every one looks familiar.
+            known = curiosity.familiar(target.workspaceDir, memIndex);
+            const justSaid = new Set(found.flatMap((g) => [curiosity.keyOf(g.text), curiosity.keyOf(g.about || "")]));
+            known = known.filter((k) => !justSaid.has(curiosity.keyOf(k)));
+          } catch { /* empty known-set still runs */ }
+
+          for (const g of found) {
+            // The thing to remember is the subject, not the whole paragraph: a
+            // 40-character question is not a topic she can carry.
+            const label = g.kind === "dangling" ? g.about : g.text;
+            const entry = curiosity.notice(target.workspaceDir, label, {
+              known,
+              reason: g.kind === "mismatch" ? `跟之前说的不一样：${String(g.about || "").slice(0, 40)}` : (g.kind === "question" ? "问了但没人答" : "没人解释过"),
+              kind: g.kind,
+              weight: gaps.weight(g.kind),
+            });
+            if (entry) {
+              probe("gap", { kind: g.kind, label: String(label).slice(0, 40), pull: Number(curiosity.pull(entry).toFixed(3)) });
+            }
+          }
+        }
+      } catch (err) {
+        api.logger?.warn?.(`dafeiyu-core: gaps failed: ${err}`);
+      }
+    }
+
+
+    // Boundary: did this message ask us to stop, or reopen the conversation?
+    //
+    // `decide.detectBoundary` was written, explained at length, and covered by six
+    // tests — and called by nothing. Measured 2026-11-06: no reference outside
+    // lib/decide.js and test/decide.test.mjs, and `probe.log` had no boundary
+    // record in its whole history. So the one rule that decides whether she may
+    // speak first again had never run.
+    //
+    // Order matters. Clearing comes first, then the new message may set a fresh
+    // one: doing it the other way round wiped every boundary in the same breath
+    // that recorded it. Speaking is what ends a silence, and the sentence that
+    // ends it is the same sentence that may ask for a new one.
+    if (proactiveCfg.enabled !== false && id && (id.personKey || id.groupKey)) {
+      const bKey = id.personKey || id.groupKey;
+      try {
+        const boundary = decide.detectBoundary(text);
+        if (boundary) {
+          proactive.noteBoundary(target.workspaceDir, bKey, boundary);
+          probe("boundary", { kind: boundary, key: bKey });
+        } else if (proactive.clearBoundary(target.workspaceDir, bKey)) {
+          // They wrote something ordinary, so an earlier 别发了 has done its job.
+          probe("boundary-cleared", { key: bKey });
+        }
+      } catch (err) {
+        api.logger?.warn?.(`dafeiyu-core: boundary check failed: ${err}`);
+      }
     }
 
     if (emotionCfg.enabled) {
@@ -2617,22 +3229,16 @@ export default function register(api) {
       api.logger?.warn?.(`dafeiyu-core: social update failed: ${err}`);
     }
   }, { priority: 100 });
-
-  // Curiosity sources 1, 3 and 4 of 4: what her own tool calls revealed.
+  // Curiosity: names she met and does not have.
   //
-  // This hook is the reason the gap list can stay populated. Every one of these
-  // signals already exists in a tool result that was produced anyway — nothing
-  // new is being asked of the model and no extra turn is spent. That is the
-  // whole argument for doing it here rather than as a "go be curious" job:
-  // a scheduled curiosity prompt is another instruction to follow, while an
-  // observation of an empty shelf is evidence.
+  // The source of a noticing is always "a name arrived", never "a lookup
+  // failed". A failed lookup is a fact about the query; meeting an unknown
+  // name is a fact about her. Only the second one can grow into wanting to
+  // know, which is why the tool-observe hook reads the *result text* for
+  // names rather than reading the error state.
   //
-  // `after_tool_call` is observe-only and handlers run concurrently, so nothing
-  // here can break a turn. Failures are logged and dropped.
-  //
-  // matcher keeps this off the hot path: without it the handler would run for
-  // every exec and every read, and the extractors would spend their time
-  // deciding that a file listing is not a knowledge gap.
+  // `after_tool_call` is observe-only and handlers run concurrently, so
+  // nothing here can break a turn. Failures are logged and dropped.
   api.on(
     "after_tool_call",
     (event, ctx) => {
@@ -2642,82 +3248,142 @@ export default function register(api) {
 
       const name = String(event?.toolName || "").trim();
       const sources = curiosityCfg.sources;
-      const hits = [];
+      let candidates = [];
+        let wentOut = false;
 
-      try {
-        // --- recall: she went looking and the shelf was empty ---
-        if (sources.recall && /^(recall_about|recall_links)$/.test(name)) {
-          for (const h of curiosityExtract.fromRecall(event)) {
-            hits.push({ ...h, source: "recall" });
-          }
-        }
-
-        // --- person lookup that did not resolve ---
-        if (sources.recall && name === "who_is") {
-          for (const h of curiosityExtract.fromWhoIs(event)) {
-            hits.push({ ...h, source: "recall" });
-          }
-        }
-
-        // --- search: she was already chasing something ---
-        if (sources.search && /^Tavily__tavily_(search|research)$/.test(name)) {
-          for (const h of curiosityExtract.fromSearch(event)) {
-            hits.push({ ...h, source: "search" });
-          }
-        }
-
-        // --- browse: an unfamiliar term while scrolling ---
-        //
-        // `known` is what makes this source quiet. Without it every latin word in
-        // a video title became a gap — measured on the 29 real douyin entries:
-        // 3 videos fired and minted `astra`, `deepseek`, `python`. `deepseek` is
-        // not a gap, she is literally running on it. The filter is fed from the
-        // gap list itself plus the terms she has already closed, so a word stops
-        // being "unfamiliar" the moment it is either recorded or resolved.
-        if (sources.browse && /^douyin_(record|act)$/.test(name)) {
-          const blob = curiosityExtract.INTERNALS.resultText(event?.result);
-          if (blob) {
-            const known = curiosity.knownTerms(target.workspaceDir);
-            for (const h of curiosityExtract.fromBrowse({ text: blob, known })) {
-              hits.push({ ...h, source: "browse" });
-            }
-          }
-        }
-      } catch (err) {
-        api.logger?.warn?.(`dafeiyu-core: curiosity extract failed: ${err}`);
-        return;
-      }
-
-      for (const hit of hits) {
         try {
-          const gap = curiosity.note(target.workspaceDir, hit.topic, {
-            source: hit.source,
-            domain: hit.domain,
-            context: hit.context,
-            display: hit.topic,
+          if (sources.search && /^Tavily__tavily_(search|research)$/.test(name)) {
+            // She went looking on purpose; the names in a result are answers-
+            // adjacent, which makes them the best candidates there are.
+            candidates = curiosityExtract.fromSearchResult(event?.result);
+          } else if (sources.browse && BROWSE_TOOLS.test(name)) {            // Everything else she does out in the world. The distinction that
+            // matters is not *which site* she was on but *whether the text is
+            // somebody else's*: a video title, a comment thread, a group chat,
+            // a Qzone post, a page she pulled up. All of those are places where
+            // an unfamiliar name can arrive without anybody asking for it.
+            //
+            // Measured on her real data, the source of text changes the yield by
+            // an order of magnitude: 42 douyin entries produced 1 unfamiliar
+            // thing, because 13 of those 16 comments were written by her. Group
+            // chat is the opposite — she is reading, not writing.
+            const text = curiosityExtract.resultText(event?.result);
+            candidates = curiosityExtract.fromSpeech(text, { max: 3 });
+            wentOut = true;
+            const asked = curiosityExtract.fromComments(text, { max: 2 });
+            if (asked.length) candidates = [...candidates, ...asked];
+          }
+
+        } catch (err) {
+          api.logger?.warn?.(`dafeiyu-core: curiosity extract failed: ${err}`);
+          return;
+        }
+
+        // Drop machine vocabulary before anything is stored.
+        //
+        // The browser tool is in BROWSE_TOOLS because it can return a page
+        // somebody wrote. It also returns its own status: `source`, `chromium`,
+        // `managed-or-attach`, `lightpanda`, `screenshot`, and raw target ids.
+        // Measured 2026-11-06: fifteen noticings from one browsing session were
+        // all of that, and `source` had been counted thirteen times — it looked
+        // like the thing she cared about most, purely because it appeared in
+        // every status line.
+        //
+        // Filtering here rather than inside the extractor keeps the extractor
+        // about text and this hook about sources, which is the split that
+        // already exists.
+        candidates = (Array.isArray(candidates) ? candidates : []).filter((c) => !isMachineName(c));
+
+      if (!candidates.length) return;
+        // She went out on her own. Nothing recorded that before, and the
+        // consequence was concrete: `KIND_LABEL` has carried a
+        // `browsed: "自己去逛了"` entry all along and no code ever wrote it, so of
+        // 40 real deeds — 31 voice, 4 sticker, 1 qzone — browsing was zero. She
+        // could not tell she had been out, could not say "我昨天翻到个东西",
+        // and a turn spent wandering left no trace.
+        //
+        // Recorded before the empty-candidates return on purpose: a browse that
+        // turned up nothing is still a browse, and "出去了，什么也没有" is a
+        // truer thing to remember than silence.
+        if (wentOut) {
+          try {
+            deeds.record(target.workspaceDir, {
+              kind: "browsed",
+              note: candidates.length ? `${name} · ${candidates.length} 个没见过的` : name,
+              ref: name,
+            });
+          } catch { /* a missing deed is not worth failing the tool call */ }
+
+          // Which *direction* she went, not just that she went out.
+          //
+          // The deed above already records that a browse happened, but it carries
+          // a tool name and a count — it cannot tell `making` from `sky`. Without
+          // the domain, `horizon.blanks()` keeps offering the same direction
+          // after she has already been there, which is what happened on
+          // 2026-11-06: `horizon:making` was handed to her at 12:30:04, she looked
+          // up 电饭煲发热原理 / IH加热 / 磁钢限温器, and `horizon.json` was still
+          // empty afterwards.
+          //
+          // Attribution reads the names she actually surfaced, in her own words.
+          // A no-match is recorded as nothing rather than guessed.
+          try {
+            const text = candidates.map((c) => (typeof c === "string" ? c : c?.name || "")).join(" ");
+            const r = horizon.note(target.workspaceDir, text, { via: name });
+            if (r.ok) probe("horizon-note", { via: name, domains: r.domains });
+          } catch { /* attribution is best-effort; the deed is the hard record */ }
+        }
+
+
+      if (!candidates.length) return;
+
+      // The known-set is what keeps this quiet. It is the union of everything
+      // in her memory index plus everything she has already wondered about, so
+      // a name stops being novel the moment it exists anywhere in her records.
+      // Without this the browse source offered `python` and `deepseek` — both
+      // of which she is running on.
+      let known = [];
+      try {
+        known = curiosity.familiar(target.workspaceDir, memIndex);
+      } catch { /* an empty known-set is still better than not running */ }
+
+      for (const candidate of candidates) {
+        try {
+          const entry = curiosity.notice(target.workspaceDir, candidate, {
+            known,
+            reason: `在 ${name} 的结果里看到`,
           });
-          if (gap) {
-            probe("curiosity-gap", {
-              via: hit.source,
-              topic: gap.topic,
-              times: gap.times_encountered,
+          if (entry) {
+            probe("curiosity-notice", {
+              name: entry.display,
+              via: name,
+              seen: entry.seen,
             });
           }
         } catch (err) {
-          api.logger?.warn?.(`dafeiyu-core: curiosity note failed: ${err}`);
+          api.logger?.warn?.(`dafeiyu-core: curiosity notice failed: ${err}`);
         }
       }
     },
     {
-      matcher: [
-        "recall_about",
-        "recall_links",
-        "who_is",
-        "Tavily__tavily_search",
-        "Tavily__tavily_research",
-        "douyin_record",
-        "douyin_act",
-      ],
+        matcher: [
+          "Tavily__tavily_search",
+          "Tavily__tavily_research",
+          "douyin_act",
+          "douyin_record",
+          "douyin_plan",
+          "douyin_status",
+          "qq_recent",
+          "qq_history",
+          "qq_group_info",
+          "qq_members",
+          "qq_qzone",
+          "qq_friends",
+          "qq_groups",
+          "qq_profile",
+          "qq_whois",
+          "qq_online",
+          "web_fetch",
+          "browser",
+        ],
     },
   );
 
@@ -3344,7 +4010,13 @@ export default function register(api) {
 
   function factory(name, build) {
     api.registerTool((ctx) => {
-      probe("tool-factory", { name, agentId: ctx?.agentId, sessionKey: ctx?.sessionKey });
+        // No probe here on purpose. This line used to fire on every single tool
+        // call, and measured 2026-11-06 it accounted for 55,650 of 58,000 probe
+        // lines — 9 MB of `state/probe.log` where the real signals (injections,
+        // boundary decisions, curiosity) were less than 1%. `tool-factory` said
+        // only "a tool was built", which every call also implies; it made the log
+        // expensive to write and impossible to read, and `selfcheck` counted its
+        // own samples off the same file.
       const target = resolveTarget(ctx);
       if (!target) return null;
       return build(target, ctx);
@@ -3707,6 +4379,7 @@ export default function register(api) {
     },
     async execute(_id, params) {
       touchDouyinSession(target.workspaceDir);
+      if (!douyinCfg.enabled) return { content: [{ type: "text", text: "抖音这块现在是关着的。" }] };
       const allow = douyinCfg.allowActions;
       const gate = douyin.requireActor({ action: params?.action, allow });
       if (!gate.ok) {
@@ -4654,112 +5327,127 @@ export default function register(api) {
     },
   }));
 
-  // Curiosity: the questions she has run into and not answered.
-  //
-  // Two tools, not one, because "what do I not know" and "I looked it up" are
-  // different actions with different evidence. Collapsing them into a single
-  // `curiosity_state(note=...)` would repeat the mistake `proactive.evaluate`
-  // made: one function answering two questions, with the caller guessing which
-  // one it got.
-  factory("curiosity_state", (target) => ({
-    name: "curiosity_state",
-    label: "没弄明白的事",
-    description:
-      "看自己攒下来的、一直没弄明白的事。" +
-      "这些不是待办，是碰见过却没弄懂的地方——查不到、看不懂、别人提了你接不上的。" +
-      "想查就去查，查完用 curiosity_resolve 划掉。不想查就放着，放着不扣分。" +
-      "没别的事可干的时候看一眼，比翻待办清单强。",
-    parameters: {
-      type: "object",
-      properties: {
-        limit: { type: "number", description: "看几条，默认 8" },
-        drop: {
-          type: "string",
-          description:
-            "把某条标记为「不想知道了」，传话题原文。是放弃，不算学会，两边都记着。",
+    // Curiosity: things she noticed and does not have an explanation for.
+    //
+    // Two tools, because "what have I been wondering about" and "go find out"
+    // are different acts. The first is reflection; the second creates an
+    // obligation she can actually carry out. Merging them is what the previous
+    // version did — it had `resolve`, which only ever *closed* records, so the
+    // mechanism could accumulate but never move.
+    factory("curiosity_state", (target) => ({
+      name: "curiosity_state",
+      label: "过眼的名字",
+      description:
+        "看自己最近在外面碰到的、没人解释过的名字。" +
+        "**这不是「你不知道的东西」清单——是不是真的不知道，只有你自己判断得了。**" +
+        "系统只记得这个名字出现过、周围没谁说明过它；它不知道你懂不懂。" +
+        "看见本来就知道的，用 curiosity_forget 划掉，别留着当噪声。" +
+        "看见真想知道、又确实不熟的，用 curiosity_want 把它变成想做的事。",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "看几条，默认 8" },
         },
+        required: [],
+        additionalProperties: false,
       },
-      required: [],
-      additionalProperties: false,
-    },
-    async execute(_toolCallId, params) {
-      const drop = String(params?.drop || "").trim();
-      if (drop) {
-        const r = curiosity.resolve(target.workspaceDir, drop, "dropped");
-        if (!r) return { content: [{ type: "text", text: `没找到「${drop}」这条。` }] };
-        probe("curiosity-drop", { topic: r.topic });
-        return { content: [{ type: "text", text: "划掉了。不想知道就不想知道。" }] };
-      }
+      async execute(_toolCallId, params) {
+        const list = curiosity.noticings(target.workspaceDir, {
+          limit: Math.max(1, Math.min(30, Number(params?.limit) || 8)),
+        });
+        const st = curiosity.stats(target.workspaceDir);
 
-      const list = curiosity.gaps(target.workspaceDir, {
-        limit: Math.max(1, Math.min(30, Number(params?.limit) || 8)),
-      });
-      const st = curiosity.stats(target.workspaceDir);
-
-      if (!list.length) {
-        return {
-          content: [
-            {
+        if (!list.length) {
+          return {
+            content: [{
               type: "text",
-              text:
-                "现在没有攒着没弄明白的事。" +
-                "\n碰到了查不到的东西，它会自己记下来，不用你管。",
-            },
-          ],
-        };
-      }
+              text: "现在没有过眼的名字。碰到不常见的，它会记下来，不用你管。",
+            }],
+          };
+        }
 
-      const lines = list.map((g, i) => {
-        const times = Number(g.times_encountered ?? 1);
-        const why =
-          times >= 2
-            ? `撞到过 ${times} 次`
-            : g.sources.includes("question")
-              ? "你自己说过不知道"
-              : g.sources.includes("search")
-                ? "你搜过，没搜明白"
-                : "碰到过，没往下想";
-        return `${i + 1}. ${g.display} —— ${why}`;
-      });
-      const tail =
-        `\n\n一共 ${st.open} 条，弄明白过 ${st.resolved} 条，放弃过 ${st.dropped} 条。` +
-        "\n这些不是欠着的账。看着有哪条想查，就去查。";
-      return { content: [{ type: "text", text: lines.join("\n") + tail }] };
-    },
-  }));
+        const rows = list.map((n, i) => {
+          const how =
+            n.seen >= 3 ? `见过 ${n.seen} 次`
+            : n.seen === 2 ? "见过两次"
+            : "见过一次";
+          const why = n.reasons.length ? `，${n.reasons[0]}` : "";
+          // No verdict is appended. "一直没绕开" reads as an assessment of her,
+          // and the only thing actually measured is how often the string
+          // appeared in text she read.
+          return `${i + 1}. ${n.display} —— ${how}${why}`;
+        });
 
-  // Closing a gap. Separate tool because it carries a claim of fact: "I know
-  // this now" is checkable later, while "I stopped caring" is not. The note is
-  // what makes the claim auditable instead of a silent state flip.
-  factory("curiosity_resolve", (target) => ({
-    name: "curiosity_resolve",
-    label: "弄明白了",
-    description:
-      "把一条没弄明白的事划掉。" +
-      "真查到答案了就用它，note 里写你弄明白了什么——下次别人问起，这就是你记得的根据。" +
-      "只是想通了「这不重要」就别用这个，用 curiosity_state 的 drop。",
-    parameters: {
-      type: "object",
-      properties: {
-        topic: { type: "string", description: "要划掉的那条，原文即可" },
-        note: { type: "string", description: "你弄明白了什么，一句话" },
+        const tail = "\n\n**这些只是名字，不是判决。** 知道哪个，就 curiosity_forget 划掉；" +
+          "真想知道哪个，就 curiosity_want 变成想做的事。" +
+          "\n放在这儿不欠什么，不用清空。";
+          return { content: [{ type: "text", text: rows.join("\n") + tail }] };
       },
-      required: ["topic"],
-      additionalProperties: false,
-    },
-    async execute(_toolCallId, params) {
-      const topic = String(params?.topic || "").trim();
-      if (!topic) return { content: [{ type: "text", text: "要划哪一条？" }] };
-      const r = curiosity.resolve(target.workspaceDir, topic, "found", params?.note || null);
-      if (!r) {
-        return {
-          content: [{ type: "text", text: `没找到「${topic}」这条。先看看 curiosity_state。` }],
-        };
-      }
-      probe("curiosity-resolve", { topic: r.topic, hasNote: Boolean(params?.note) });
-      return { content: [{ type: "text", text: "记下了。这条算弄明白了。" }] };
-    },
-  }));
+    }));
+
+    // Turning a noticing into a want.
+    //
+    // This is the step that makes curiosity do something. Everything above only
+    // records that a name was unfamiliar; this hands it to `wants`, which is the
+    // channel that can actually steer a wake and get her to go and look.
+    //
+    // Without it the whole mechanism is a notebook. That was the mistake worth
+    // not repeating.
+    factory("curiosity_want", (target) => ({
+      name: "curiosity_want",
+      label: "想弄明白",
+      description:
+        "把一条「过眼的名字」变成你真想去做的事，交给想做的事那一栏。" +
+        "用之前先问自己一句：这个我是真不知道，还是只是没往这儿想过？" +
+        "真不知道、又想知道，才用。" +
+        "交出去之后它会像别的心愿一样被安排，可能今天就查，也可能过几天。",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string", description: "哪一条，原文即可" },
+        },
+        required: ["topic"],
+        additionalProperties: false,
+      },
+      async execute(_toolCallId, params) {
+        const topic = String(params?.topic || "").trim();
+        if (!topic) return { content: [{ type: "text", text: "哪一条？" }] };
+        const r = curiosity.handOff(target.workspaceDir, topic, wants);
+        probe("curiosity-want", { topic, ok: r.ok, reason: r.reason ?? null });
+        if (!r.ok) return { content: [{ type: "text", text: r.reason }] };
+        return { content: [{ type: "text", text: "记下了。这事排进去了。" }] };
+      },
+    }));
+
+    // Dropping one. Named "forget" rather than "resolve" on purpose: there is
+    // no claim of understanding here, and naming it after understanding would
+    // let the stats fill with things she never learned.
+    factory("curiosity_forget", (target) => ({
+      name: "curiosity_forget",
+      label: "划掉",
+      description:
+        "把一个名字从「过眼的名字」里划掉。" +
+        "**本来就知道的，就该用这个。** 系统认不出你懂不懂，只会把形状像名字的都记下来，" +
+        "划掉是在纠正它，不是在承认失败。" +
+        "真不感兴趣的也用它。真的查明白之后不用调——查明白了它自己就不拉你了。",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string", description: "哪一条，原文即可" },
+        },
+        required: ["topic"],
+        additionalProperties: false,
+      },
+      async execute(_toolCallId, params) {
+        const topic = String(params?.topic || "").trim();
+        if (!topic) return { content: [{ type: "text", text: "哪一条？" }] };
+        const r = curiosity.loseInterest(target.workspaceDir, topic);
+        probe("curiosity-forget", { topic, ok: r.ok });
+        if (!r.ok) return { content: [{ type: "text", text: r.reason }] };
+        return { content: [{ type: "text", text: "放掉了。" }] };
+      },
+    }));
+
 
   factory("activity_state", (target) => ({
     name: "activity_state",
@@ -4826,6 +5514,81 @@ export default function register(api) {
     },
   }));
 
+  factory("horizon_state", (target) => ({
+    name: "horizon_state",
+    label: "看看自己没碰过什么",
+    description:
+      "看一张地图：哪些大方向你一条都没记过，哪些沾过一点，哪些有东西。" +
+      "不是课程表，也不是待办。" +
+      "好奇不是等别人提一嘴你才想起来，是知道自己有一大片地方没去过。" +
+      "出去碰过之后用 horizon_visit 记一笔（不记的话下次还会推同一个）。",
+    parameters: {
+      type: "object",
+      properties: {
+        all: { type: "boolean", description: "true 就全部列出来，默认只列空的" },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params) {
+      const mp = horizon.map(target.workspaceDir);
+      const hist = horizon.history(target.workspaceDir, 5);
+      const showAll = params?.all === true;
+
+      const line = (d) =>
+        `- ${d.label}${d.hits ? `（记过 ${d.hits} 个）` : "（一条都没有）"}`;
+
+      const blocks = [];
+      blocks.push(`没碰过的 ${mp.empty.length} 个方向：\n${mp.empty.map(line).join("\n") || "（没有）"}`);
+
+      if (showAll) {
+        blocks.push(`沾过一点：\n${mp.thin.map(line).join("\n") || "（没有）"}`);
+        blocks.push(`有东西的：\n${mp.covered.map(line).join("\n") || "（没有）"}`);
+      }
+
+      blocks.push(
+        hist.total
+          ? `出去过 ${hist.total} 次，最近：\n${hist.recent.map((v) => `- ${horizon.DOMAINS[v.domain]?.label || v.domain}`).join("\n")}`
+          : "还没专门出去碰过哪个方向。",
+      );
+
+      blocks.push(`一共 ${mp.total} 个方向。没碰过不代表不会，只代表你还没写过它。`);
+
+      probe("horizon-state", { empty: mp.empty.length, visits: hist.total });
+      return { content: [{ type: "text", text: blocks.join("\n\n") }] };
+    },
+  }));
+
+  factory("horizon_visit", (target) => ({
+    name: "horizon_visit",
+    label: "记下碰过哪个方向",
+    description:
+      "从某个方向回来之后调一次。记过之后，那一类就不会再被当成空白推给你。" +
+      "没碰到东西也要记——「去了，没意思」是完整的结果，不记的话下次还推同一个。",
+    parameters: {
+      type: "object",
+      properties: {
+        domain: { type: "string", description: "方向 id，从 horizon_state 里拿" },
+        found: { type: "string", description: "一句话：看到了什么。没有就空着" },
+        kept: { type: "boolean", description: "有没有留在记忆里" },
+      },
+      required: ["domain"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params) {
+      const r = horizon.visit(target.workspaceDir, params?.domain, {
+        found: params?.found,
+        kept: params?.kept === true,
+      });
+      probe("horizon-visit", { domain: params?.domain, ok: r.ok, total: r.total });
+      if (!r.ok) {
+        const ids = Object.keys(horizon.DOMAINS).join(" / ");
+        return { content: [{ type: "text", text: `${r.reason}。可选的是：${ids}` }] };
+      }
+      return { content: [{ type: "text", text: "记下了。" }] };
+    },
+  }));
+
   factory("want_do", (target) => ({
     name: "want_do",
     label: "记下想干的",
@@ -4852,6 +5615,20 @@ export default function register(api) {
       if (doneId || dropId) {
         const r = wants.close(target.workspaceDir, doneId || dropId, dropId ? "dropped" : "done");
         probe("want-close", { id: doneId || dropId, ...r });
+        // Closing the thing she was circling is what breaks the streak.
+        //
+        // Without this the streak counter only ever grows: it records what won
+        // each wake, and a want that is finished stops being offered, so the
+        // counter would keep the old key at the top and `stalled` would stay on
+        // for the next unrelated crop of candidates. The visible symptom would be
+        // that she stops being told about the loop after she already dealt with
+        // it, which is the right answer for the wrong reason.
+        if (r.ok) {
+          try {
+            compulsion.clear(target.workspaceDir);
+            probe("compulsion-clear", { because: "closed", id: doneId || dropId });
+          } catch { /* history is diagnostic, never load-bearing */ }
+        }
         return {
           content: [{ type: "text", text: r.ok ? (dropId ? "放掉了。" : "做完了。") : r.reason }],
         };
@@ -5199,11 +5976,11 @@ export default function register(api) {
   // It must be sent as `image` with sub_type 1; a `mface` segment is accepted
   // but NapCat answers -13100 and QQ never renders it.
   // QQ keeps collected stickers in this directory, one file per md5.
-  //
-  // The container hash is machine-specific. Override with
-  // `config.stickerEmojiDir` rather than editing this default.
-  const EMOJI_DIR = cfg.stickerEmojiDir ||
-    path.join(os.homedir(), "Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ/nt_qq_<hash>/nt_data/Emoji/personal_emoji/Ori");
+  const EMOJI_DIR = process.env.QQ_EMOJI_DIR
+    || path.join(
+      os.homedir(),
+      "Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ/nt_qq_<hash>/nt_data/Emoji/personal_emoji/Ori",
+    );
 
   // The ONLY valid stickers are the 19 below, every one verified to be the
   // blue-whale maid character. Do not add anything else to this table.
@@ -5215,7 +5992,7 @@ export default function register(api) {
   // once. QQ's emoji folder is the *user's own* collection, not this agent's
   // asset library. Never source stickers from it wholesale again.
   //
-  // These 19 map 1:1 to <workspace>/assets/stickers/*.jpg
+  // These 19 map 1:1 to workspace-dafeiyu/assets/stickers/*.jpg
   // (md5-identical, 19/19 verified).
   const STICKERS = {
     taunt: "BB97AA6071CC6C0B6A4B811A18B584D1",
@@ -5242,8 +6019,8 @@ export default function register(api) {
   const STICKER_EXTS = [".gif", ".jpg", ".png", ".webp"];
 
   // NapCat runs inside the QQ sandbox and CANNOT open arbitrary host paths.
-  // Asking it to read <workspace>/assets/... returns
-  //   EPERM: operation not permitted, open '<home>/.openclaw/...'
+  // Asking it to read workspace-dafeiyu/assets/... returns
+  //   EPERM: operation not permitted, open '~/.openclaw/...'
   // even though the file exists and is world-readable. The only directory it
   // may read is its own shared dir:
   //   ~/Library/Containers/com.tencent.qq/Data/Documents/napcat/shared
@@ -5335,7 +6112,7 @@ export default function register(api) {
   }
 
   // Keep the NapCat-readable mirror in sync with the canonical asset folder.
-  // Runs once per plugin load so editing <workspace>/assets/stickers and
+  // Runs once per plugin load so editing workspace-dafeiyu/assets/stickers and
   // reloading is enough; nobody has to remember a manual copy step.
   function syncStickerMirror(workspaceDir) {
     const src = path.join(workspaceDir, "assets", "stickers");
@@ -5374,7 +6151,7 @@ export default function register(api) {
   try {
     const ws =
       api.config?.agents?.entries?.dafeiyu?.workspace ||
-      path.join(os.homedir(), ".openclaw", `workspace-${agents[0] || "agent"}`);
+      path.join(os.homedir(), ".openclaw", "workspace-dafeiyu");
     const r = syncStickerMirror(ws);
     if (r?.copied) {
       console.log(`[dafeiyu-core] sticker mirror synced: ${r.copied} file(s)`);
@@ -5756,7 +6533,7 @@ export default function register(api) {
       let audioBytes = null;
       try {
         const proc = spawnSync(
-          cfg.ttsScript || path.join(os.homedir(), ".openclaw", "bin", "breeze-tts.sh"),
+          process.env.BREEZE_TTS_SH || path.join(os.homedir(), ".openclaw/bin/breeze-tts.sh"),
           [`${tag}${spokenText}`, hostOut],
           { timeout: 115000, maxBuffer: 16 * 1024 * 1024 },
         );

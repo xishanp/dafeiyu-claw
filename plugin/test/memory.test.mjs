@@ -237,11 +237,12 @@ test("want_do: 试过多次后权重下降", async () => {
   fs.mkdirSync(path.join(ws, "state"), { recursive: true });
   const { id } = wants.add(ws, { what: "老是惦记但一直没做的事", value: 1 });
   const first = intent.collect(ws).find((c) => c.kind === "want").value;
-  wants.touch(ws, id);
-  wants.touch(ws, id);
+  // 前四次不掉分：重新拾起来不是打转，做第 5 次才算。
+  for (let k = 0; k < 4; k++) wants.touch(ws, id);
+  assert.equal(intent.collect(ws).find((c) => c.kind === "want").value, first, "前四次不该扣分");
   wants.touch(ws, id);
   const later = intent.collect(ws).find((c) => c.kind === "want").value;
-  assert.ok(later < first, `试过多次后应下降：${first} → ${later}`);
+  assert.ok(later < first, `第 5 次开始应下降：${first} → ${later}`);
 });
 
 test("活动分类：认得出在干什么", async () => {
@@ -253,18 +254,45 @@ test("活动分类：认得出在干什么", async () => {
   assert.equal(a.classify("今天天气不错"), null, "没有活动的句子不算");
 });
 
-test("活动扫描：刷到不算产出", async () => {
+test("活动扫描：刷到算她自己干的", async () => {
+  // This test asserted the opposite until 2026-11-06: 「刷到是被动」.
+  //
+  // It was wrong for Chinese. 「刷到一条讲哈雷彗星的」 is first person — she
+  // opened it and looked. The passive reading came from the English phrase
+  // "came across", which is what the original rule was written to catch. With
+  // 刷到 excluded, real data showed `scroll` at 46 exposure / 4 done while she
+  // scrolled constantly, and the scoring loop kept proposing "go try scrolling"
+  // because the counters said she barely did it.
+  //
+  // What the rule is actually for survives: the owner's own lines are not her
+  // activity. He wrote 「你多刷刷抖音」 into the same file, and that is the case
+  // worth excluding.
   const a = await import("../lib/activities.js");
   const ws = tmp();
   fs.mkdirSync(path.join(ws, "memory"), { recursive: true });
   fs.writeFileSync(
     path.join(ws, "memory", "2026-11-05.md"),
-    "本鱼: 刷到一条讲彗星的\n本鱼: 刷到个视频\n本鱼: 画了一条鱼\n",
+    "本鱼: 刷到一条讲彗星的\n本鱼: 刷到个视频\n本鱼: 画了一条鱼\n对方: 你多刷刷抖音\n",
   );
   const d = a.scan(ws);
-  assert.equal(d.kinds.scroll.exposure, 2);
-  assert.equal(d.kinds.scroll.done, 0, "刷到是被动，不算自己干的");
+  assert.equal(d.kinds.scroll.done, 2, "刷到是她自己看到的，要算她做的");
+  assert.equal(d.kinds.scroll.exposure, 2, "对方那句话不能被算进来");
   assert.equal(d.kinds.draw.done, 1);
+});
+
+test("活动扫描：真的被推着看才算 passive", async () => {
+  // 「刷到」 is her saying she saw something. 「被推给我」 is the actual passive
+  // case, and it stays excluded from done.
+  const a = await import("../lib/activities.js");
+  const ws = tmp();
+  fs.mkdirSync(path.join(ws, "memory"), { recursive: true });
+  fs.writeFileSync(
+    path.join(ws, "memory", "2026-11-05.md"),
+    "本鱼: 刷了三条，有一条是被推给我的\n",
+  );
+  const d = a.scan(ws);
+  assert.equal(d.kinds.scroll.exposure, 1);
+  assert.equal(d.kinds.scroll.done, 0, "被推的算曝光不算产出");
 });
 
 test("活动空白：没干过的排最前", async () => {
@@ -312,9 +340,16 @@ test("活动：她自己的想头优先于新奇建议", async () => {
   fs.writeFileSync(path.join(ws, "memory", "2026-11-05.md"), "本鱼: 画了一天\n");
   a.scan(ws);
 
-  // 没有自己的想头时，可以给新奇建议
+  // 手上什么都没有时，不给「试试拍一张」这种卡片。
+  //
+  // 这条原来是 `assert.ok(all.some(c => c.kind === "gap"))`，断言空手必须有
+  // 一个 gap 建议。2026-11-06 改掉了：空手的正确去向是去一个没碰过的方向
+  // （由 decide 的 whenEmpty 提供），不是在十二类活动里轮流挑一个来打发。
+  //
+  // 走廊删掉之后池子真的空了，实测 `gap:shoot` 以 0.297 抢下了那一轮——
+  // 「试试拍一张」填满了本该去探索的空档。
   let all = intent.collect(ws);
-  assert.ok(all.some((c) => c.kind === "gap"), "空手时应该给一个空白建议");
+  assert.equal(all.find((c) => c.kind === "gap"), undefined, "空手时不该用 gap 补位");
 
   // 有了自己的想头，新奇建议让位——但仍在池子里。
   //
@@ -511,9 +546,10 @@ test("门槛：做过一次的类型仍然能被提（0.2 不是 0.7）", async 
   // 不是某个环境下的算术结果。
   assert.ok(tidy.novelty >= a.PROPOSAL_FLOOR, "必须还在门槛之上");
 
-  // 真正的回归点：这样做之后，整体候选池不能空
-  const cands = intent.collect(ws);
-  assert.ok(cands.length > 0, "做完一次就把候选清空是缺陷");
+  // 门槛仍在：这一条测的是 activities.gaps() 有没有把做过的类型排除掉。
+  // 注意现在 intent.collect() 空手时不再产出 gap 候选（见上面那条），
+  // 所以「候选池不能空」这个断言已经不适用于这个工作区 —— 空池是正确结果，
+  // 由 decide 的 whenEmpty 兜底去探索。门槛本身仍由 tidy.novelty 钉住。
 
   // 门槛本身钉住数值，防止下次又被调回 0.7
   assert.equal(a.PROPOSAL_FLOOR, 0.2);
@@ -541,13 +577,24 @@ test("wants：touch 过几次，分值必须掉下来", async () => {
   wants.touch(ws, r.id);
   wants.touch(ws, r.id);
 
+  // 前三次不掉分。
+  //
+  // 这条原来断言的是「推过三次必须掉分」，配合一个 0.4 的折扣下限。两个都
+  // 在 2026-11-06 改掉了：那个下限让 value 1.0 的 want 做 5 次后还有 0.40，
+  // 永远是候选——「会不会停」由她当初随口写的数字决定，而不是由「反复做」
+  // 这件事决定。走廊那条正好 0.45，所以下限看着是对的。
+  //
+  // 重新拾起来不是打转。第 5 次才开始算。
   const after = valueOf();
-  assert.ok(after < first, "推过三次必须掉分，否则会一直霸着候选位");
-  assert.ok(after > 0, "但也不能掉到零——她还可以改主意");
-
-  // The floor in lib/intent.js is 0.4x; past it, more touches stop mattering.
-  // Pinned so a future "make it decay faster" edit has to be deliberate.
-  assert.ok(after / first >= 0.39, "折扣下限是 0.4 倍，不该无限衰减");
+  assert.equal(after, first, "前三次不该扣分");
+  wants.touch(ws, r.id);  // 第 4 次
+  wants.touch(ws, r.id);  // 第 5 次
+  const at5 = valueOf();
+  assert.ok(at5 < first, "第 5 次要开始降");
+  wants.touch(ws, r.id);
+  wants.touch(ws, r.id);
+  wants.touch(ws, r.id);
+  assert.ok(valueOf() < at5, "之后要继续降，不能停在某个地板");
 });
 
 test("wants：index.js 必须在 decide 出 do 时调用 touch（接线不能断）", () => {
@@ -569,4 +616,65 @@ test("wants：index.js 必须在 decide 出 do 时调用 touch（接线不能断
   const doAt = src.indexOf('action.kind === "do"');
   const touchAt = src.indexOf("wants.touch(");
   assert.ok(doAt > 0 && touchAt > doAt, "touch 必须在 do 分支里，不能在渲染列表时");
+});
+
+test("活动扫描：对方说的话一个字都不能算成她干的", async () => {
+  // Weak version failed to catch anything: the earlier test had only one owner
+  // line and the assertion still passed after the filter was removed, because
+  // 「你多刷刷抖音」 classified as `scroll` only by coincidence of the verb table.
+  //
+  // This one makes the owner's line the *only* occurrence of the kind. If the
+  // filter is gone, `tidy` appears with exposure 1 and the assertion fails.
+  const a = await import("../lib/activities.js");
+  const ws = tmp();
+  fs.mkdirSync(path.join(ws, "memory"), { recursive: true });
+  fs.writeFileSync(
+    path.join(ws, "memory", "2026-11-05.md"),
+    "对方: 你把桌子收拾一下\n本鱼: 画了一条鱼\n",
+  );
+  const d = a.scan(ws);
+  assert.equal(d.kinds.tidy.exposure, 0, "对方让她收拾，不等于她收拾了");
+  assert.equal(d.kinds.tidy.done, 0);
+  assert.equal(d.kinds.draw.done, 1);
+});
+
+test("顺序：手里有事 → 先做手里的；手里空了 → 去探索（不是补位闲聊）", async () => {
+  // 这两句话是 owner 2026-11-06 定的规则，原文：
+  //   「优先看下手中的事 然后去探索未知的」
+  //
+  // 之前的代码两次违背它：
+  //   1. 空手时 gap 立刻冒出来当候选（`gap:shoot` 0.297 抢下一轮），
+  //      于是「去探索」被「试试拍一张」顶掉了；
+  //   2. horizon 作为候选参与打分，0.42 对 want 的 0.45，三个百分位
+  //      决定了它永远轮不到。
+  //
+  // 现在两条分开：want 赢时就是 want；want 空了池子也空，由 decide 兜底。
+  const intent = await import("../lib/intent.js");
+  const wants = await import("../lib/wants.js");
+  const decide = await import("../lib/decide.js");
+  const activities = await import("../lib/activities.js");
+  const fs2 = await import("node:fs");
+  const path2 = await import("node:path");
+
+  const ws = tmp();
+  fs2.mkdirSync(path2.join(ws, "memory"), { recursive: true });
+  fs2.mkdirSync(path2.join(ws, "state"), { recursive: true });
+  fs2.writeFileSync(path2.join(ws, "memory", "2026-11-05.md"), "本鱼: 画了一天\n");
+  activities.scan(ws);
+
+  const ctx = { hour: 13, familiarity: 0.8, phase: "productive", spokeToday: 0, minutesSinceTalk: 999 };
+  const going = { id: "horizon:making", kind: "horizon", title: "去碰一下「东西是怎么做出来的」" };
+
+  // 手里空了：候选池空，决策落到探索
+  let r = intent.rankNow(ws, { threshold: 0.25 });
+  assert.equal(r.do.length, 0, "没有 want 时不该有候选硬撑着");
+  let a = decide.decide(r.do, ctx, { whenEmpty: going });
+  assert.equal(a.kind, "do", "手里空了应该去探索，不是休息");
+  assert.equal(a.candidate.id, "horizon:making");
+
+  // 手里有事：want 赢，探索让位
+  wants.add(ws, { what: "想去看看那条河", value: 0.8 });
+  r = intent.rankNow(ws, { threshold: 0.25 });
+  a = decide.decide(r.do, ctx, { whenEmpty: going });
+  assert.equal(a.candidate.kind, "want", "手里有事的时候，先做手里的");
 });

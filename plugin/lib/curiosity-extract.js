@@ -1,309 +1,329 @@
-// Gap extraction: turning what happened in a turn into a topic worth knowing.
+// Finding things she might not know.
 //
-// The original (dsh-brainagent) had one signal — empty recall — and one caller.
-// One signal in a system that produces four kinds of ignorance means the gap
-// list stays empty, which is exactly the failure we already had with
-// `activity-inject`: a mechanism that is correct and never fires.
+// This module does one thing: given a piece of text, return the specific things
+// in it that a person could plausibly need explained. Not topics, not phrases,
+// not "what this paragraph is about". Particulars.
 //
-// So the extraction is split out from the store (`lib/curiosity.js`) and given
-// four explicitly attributed inputs. Attribution matters beyond bookkeeping:
+// Three signals, in descending order of precision:
 //
-// - `recall`   she went looking, shelf was empty. The strongest signal.
-// - `question` she said out loud that she does not know. Rare, very strong.
-// - `search`   she looked something up. Means the gap was already felt — a
-//              record of it, not a discovery.
-// - `browse`   she saw a word or name she does not recognise while scrolling.
-//              Weakest, and the one that fires most, which is why it is the
-//              one that most needs a floor.
+//   1. Latin names — `Zink`, `gpt-4.1`, `c++`, `node.js`. A capitalised latin
+//      word or anything with digits/punctuation in it. This is the reliable
+//      case, because in mixed Chinese prose a capitalised latin word is almost
+//      always a proper name rather than vocabulary.
 //
-// Everything here is pure: text in, topics out. No I/O, no model calls. That
-// keeps it testable without a workspace and cheap enough to run inside
-// `after_tool_call`, which must never stall a turn.
+//   2. Questions — `靠什么知道该进还是该退` / `什么是 redox`. Chinese has no
+//      casing, so shape carries no information about proper-noun-hood. What
+//      Chinese does have is question grammar, and a question is by definition
+//      a place where understanding is missing. This is a *weaker* signal than
+//      (1) — a question may be rhetorical or already answered — but it is the
+//      only structural signal Chinese offers.
 //
-// The deliberate refusal: no extraction from *her own output*. Her own words
-// are already in the loop as wants and notes. Reading them back as gaps would
-// make her curious about herself, which is a different (and much louder)
-// failure mode than being curious about the world.
+//   3. Nothing else. Chinese n-gram novelty was tried and abandoned: measured
+//      against 131 KB of her own memory it produced `自制科技小玩`,
+//      `是最孤独的浪`, `有人撞了你一` — fragments of ordinary prose, cut at
+//      arbitrary boundaries. The failure is structural, not a tuning problem:
+//      without a word segmenter and a general vocabulary, "not in my 131 KB of
+//      notes" is indistinguishable from "not a word". Noise here is worse than
+//      silence, because a list full of ordinary phrases teaches her that the
+//      list is not worth reading.
+//
+// Everything returned is a *candidate*. Whether it is novel, and whether it
+// pulls on her, is decided in curiosity.js.
 
-/** Words that mean "I do not know", in the forms she actually uses. */
-const NOT_KNOWING = [
-  "不知道",
-  "不清楚",
-  "没听说过",
-  "没听过",
-  "不太懂",
-  "不懂",
-  "不了解",
-  "没概念",
-  "啥是",
-  "什么是",
-  "是啥",
-  "怎么回事",
-  "没搞明白",
-  "没弄明白",
-  "想不起来",
-  "记不清",
+// Words that show up in this plugin's own tool output and in ordinary English
+// prose. The latin branch below only accepts capitalised words and words with
+// digits or punctuation, which already excludes most vocabulary — but sentence-
+// initial words pass that shape test, so the common openers are listed here.
+// Kept short on purpose: a long blocklist ages badly and silently rots.
+const COMMON = new Set([
+  "the", "this", "that", "these", "those", "there", "their", "them", "then",
+  "they", "with", "from", "which", "while", "when", "where", "what", "whom",
+  "whose", "would", "could", "should", "about", "after", "before", "other",
+  "also", "than", "more", "most", "some", "such", "only", "over", "into",
+  "just", "like", "made", "make", "many", "much", "must", "need", "next",
+  "once", "part", "same", "seen", "take", "thing", "think", "through", "time",
+  "told", "took", "turn", "under", "until", "very", "want", "well", "were",
+  "will", "within", "without", "word", "work", "world", "year", "your",
+  "here", "have", "been", "does", "did", "was", "are", "but", "not", "you",
+  "all", "any", "can", "for", "and", "its", "our", "out", "one", "two", "new",
+  "use", "used", "using", "see", "seen", "get", "got", "how", "why", "who",
+  "now", "may", "way", "day", "let", "say", "said", "she", "him", "her",
+  // Structural noise from tool output and JSON-ish payloads.
+  "http", "https", "www", "json", "null", "none", "true", "false", "error",
+  "warning", "status", "result", "output", "input", "value", "count", "text",
+  "data", "type", "name", "size", "utf", "ascii", "hash", "index", "total",
+  "undefined", "async", "await", "const", "function", "return", "import",
+  "export", "default", "void", "false",
+]);
+
+// Extensions that mean "this token is a filename", not "this token is a name".
+// Matched only when the token actually ends in one, so `node.js` and `gpt-4.1`
+// still pass: neither extension is in this list.
+const FILE_EXT = new Set([
+  "md", "txt", "json", "jsonl", "yaml", "yml", "toml", "ini", "cfg", "conf",
+  // `js`, `ts`, `py`, `go`, `rs`, `c` are deliberately absent: they are also
+  // language names, and `node.js` / `learn.py` are things she might legitimately
+  // not know. A file called `x.js` is caught by the multi-segment check below.
+  "mjs", "cjs", "tsx", "jsx", "rb", "java", "cpp", "hpp", "bash", "ps1",
+  "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "pdf",
+  "mp4", "mov", "mp3", "wav", "m4a", "webm", "flac",
+  "log", "tmp", "bak", "zip", "tar", "gz", "dmg", "iso",
+  "html", "css", "scss", "lock", "env", "sql", "db", "sqlite",
+]);
+
+// Question grammar in Chinese. Each entry captures the part *after* or
+// *before* the interrogative, because that is where the unknown sits.
+const ZH_QUESTION = [
+  /(?:什么是|什么叫|啥是|是啥|啥意思|什么意思|怎么理解|是什么东西|是干什么的)[\s「"']*([\u4e00-\u9fa5A-Za-z0-9][\u4e00-\u9fa5A-Za-z0-9.\-+#_]{1,14})/g,
+  /([\u4e00-\u9fa5A-Za-z0-9][\u4e00-\u9fa5A-Za-z0-9.\-+#_]{1,14})\s*(?:是什么|是啥|什么意思|是干什么的|怎么用|干嘛的)/g,
 ];
 
-/** Phrases that only look like ignorance. Excluded so the list stays honest. */
-const FALSE_POSITIVES = [
-  "不知道你",
-  "不知道该怎么",
-  "不知道说什么",
-  "不懂事",
-  "不管",
-  "不认识路",
-];
-
-/** A candidate must be at least this long after trimming to count as a topic. */
-const MIN_TOPIC = 2;
-const MAX_TOPIC = 60;
-
-function tidy(s) {
-  return String(s ?? "")
-    .replace(/[「」『』"'“”‘’]/g, "")
-    .replace(/[\s\u3000]+/g, " ")
-    .replace(/^[，,、；;：:。\.\s]+/, "")
-    .replace(/[，,、；;：:。\.\s]+$/, "")
-    .trim();
-}
-
-/** Strip a trailing particle clause so "X是什么" yields "X". */
-function stripQuestionTail(s) {
-  return tidy(
-    String(s ?? "")
-      .replace(/(是什么东西|是什么|是啥|是怎么回事|怎么回事|怎么办|为什么|为啥|是谁|吗|呢|啊|呀|吧)\s*$/g, "")
-      .replace(/^(为什么|为啥|什么是|啥是|请问)/g, ""),
-  );
-}
-
-function accept(candidate) {
-  const t = stripQuestionTail(candidate);
-  if (t.length < MIN_TOPIC || t.length > MAX_TOPIC) return null;
-  // A topic made only of punctuation or only of one repeated character is not
-  // a topic. Both happen when a regex slice lands on a fragment.
-  if (!/[\p{L}\p{N}]/u.test(t)) return null;
-  if (/^(.)\1+$/u.test(t)) return null;
-  return t;
-}
+// A whole question, for the case where the unknown is not a noun but the
+// question itself ("靠什么知道该进还是该退"). Bounded so a paragraph does not
+// come back as one giant entry.
+// Note: ASCII space is a separator too. `为什么不直接烤 非用 2.45GHz？` is one
+// question; letting it run across spaces truncated real ones at the length cap.
+const ZH_WHOLE_QUESTION = /([^，。！？\n「」\t]{6,44})[？?]/g;
+const HAS_INTERROGATIVE = /什么|为什么|怎么|如何|到底|是否|能不能|为啥|多少|哪|谁/;
 
 /**
- * Signals from a `recall_about` / `who_is` / `recall_links` result.
+ * Latin-shaped names in the text.
  *
- * The wording is the contract: these tools already say plainly when the shelf
- * was empty ("没找到关于「X」的牵连", "查不到就是真没连上"). Parsing our own
- * tool's prose is not elegant, but it is the only place the emptiness is
- * *stated* — inferring it from a short result would guess wrong on a genuinely
- * short answer.
- *
- * Returns [] when the call found something. A hit is not a gap; that is the
- * entire point of the distinction.
+ * Acceptance: starts uppercase, OR carries digits/punctuation (`gpt-4.1`,
+ * `c++`, `node.js`, `h264`). Rejecting lowercase vocabulary by shape is what
+ * keeps `language` and `driver` out — an earlier version accepted every word
+ * of four letters or more and produced both of those from one sentence.
  */
-export function fromRecall(evt) {
-  // `event` comes from a hook and is typed optional. Destructuring a null
-  // throws before any guard can run, so the guard has to be the first line.
-  const { params, result } = evt && typeof evt === "object" ? evt : {};
-  const text = resultText(result);
-  if (!text) return [];
-
-  const query = tidy(params?.query || params?.about || params?.name || "");
-  const empty =
-    /没找到|查不到|没有找到|没有关于|没有相关|真没连上|找不到/.test(text);
-  if (!empty) return [];
-
-  // Prefer the phrase the tool itself quoted when it echoed the query, because
-  // it is already the display form she used.
-  const quoted = text.match(/[「『]([^」』]{2,60})[」』]/);
-  const topic = accept(quoted?.[1] || query);
-  if (!topic) return [];
-  return [{ topic, domain: "knowledge", context: text.slice(0, 100) }];
-}
-
-/**
- * Signals from a person-lookup that did not resolve.
- *
- * Separate from `fromRecall` because the domain differs: "who is this" is a
- * person gap, and a person gap should be phrased as a question about a person
- * rather than about a fact. Kept narrow on purpose — `who_is` returning
- * nothing is common for strangers she has merely seen, and recording every one
- * of those would fill the list with strangers.
- */
-export function fromWhoIs(evt) {
-  const { params, result } = evt && typeof evt === "object" ? evt : {};
-  const text = resultText(result);
-  if (!text) return [];
-  if (!/不认识|没见过|没记录|查不到|没找到|没有关于/.test(text)) return [];
-
-  const name = tidy(params?.name || params?.query || "");
-  // Only names she addressed by name, not ids or blank lookups.
-  if (!name || /^\d+$/.test(name)) return [];
-  const topic = accept(`「${name}」是谁`);
-  if (!topic) return [];
-  return [{ topic, domain: "person", context: text.slice(0, 100) }];
-}
-
-/**
- * Signals from her own prose: "我不知道 X 是什么".
- *
- * This is the highest-precision source and the rarest. It only fires on
- * explicit self-report, which is why the false-positive list matters: "不知道
- * 你在说什么" and "我不知道该怎么办" are the same surface form and neither is
- * a knowledge gap.
- */
-/**
- * The topic of "X 我不知道", where the marker comes LAST.
- *
- * Forward extraction cannot see this at all — there is nothing after 不知道 —
- * and it is the more natural Chinese order. Walk back to the previous clause
- * boundary, then peel the conjunction and the pronoun/verb scaffolding that
- * sits between the topic and the marker.
- */
-function backwardTopic(scan, at) {
-  const before = scan.slice(Math.max(0, at - 60), at);
-  const chunks = before.split(/[。！？!?\n；;，,、]/).map((c) => c.trim()).filter(Boolean);
-
-  // Walk back across chunks, not just the last one. "某某为什么掉得最快，我
-  // 不知道" puts the topic one comma earlier than the pronoun, so taking only
-  // the final chunk yields "我" — a pronoun, not a topic.
-  for (let i = chunks.length - 1; i >= 0 && i >= chunks.length - 3; i--) {
-    const candidate = peel(chunks[i]);
-    if (!candidate) continue;
-    // A lone pronoun or filler is scaffolding, not a topic. Keep walking.
-    if (/^(我|我们|你|他|她|它|这|那|这个|那个|什么|怎么)$/.test(candidate)) continue;
-    if (candidate.length < 2) continue;
-    return candidate;
-  }
-  return "";
-}
-
-/** Strip conjunctions in front and pronouns/auxiliaries behind. */
-function peel(clause) {
-  // A clause that is already a question ("某某为什么掉得最快") is the topic
-  // verbatim — it must not be peeled, or the question mark survives as the
-  // whole topic and `accept` rejects it as punctuation.
-  const unpunctuated = clause.replace(/[？?]+\s*$/, "").trim();
-  if (/为什么|为啥|怎么|如何|多少|哪里|什么/.test(unpunctuated)) {
-    return unpunctuated;
-  }
-  let t = clause.replace(/^(但|但是|不过|而且|然后|所以|因此|只是|可|却)\s*/g, "").trim();
-  for (let i = 0; i < 3; i++) {
-    const next = t
-      .replace(/(我|我们|也|都|还|真的|确实|其实|就是|好像|一直|从来)\s*$/g, "")
-      .trim();
-    if (next === t) break;
-    t = next;
-  }
-  return t;
-}
-
-export function fromQuestion(text, opts) {
-  const { context = null } = opts && typeof opts === "object" ? opts : {};
+export function latin(text) {
   const raw = String(text ?? "");
   if (!raw) return [];
 
-  // The false positives are phrases, not sentences: "我不知道你在说什么" and
-  // "我不知道 Zink 是什么" share a prefix and only one is a gap. Blank the
-  // offending phrase out spatially rather than skipping the whole sentence,
-  // so a sentence carrying both still yields its honest half.
-  let scan = raw;
-  for (const bad of FALSE_POSITIVES) {
-    if (scan.includes(bad)) {
-      scan = scan.split(bad).join("　".repeat(bad.length));
-    }
-  }
-
+  // Latin-1 accented letters are included on purpose. `Schrödinger` without `ö`
+  // matches as `Schr`, which is not a name anyone can look up — and a truncated
+  // name is worse than no name, because it enters the list looking legitimate
+  // and then never matches anything she reads later.
+  // `\b` is not used at the tail: in JavaScript `\b` is defined against
+  // `[A-Za-z0-9_]`, so `Poincaré` ends on a non-word character and the boundary
+  // test cuts the last letter. Explicit lookarounds over the same class keep the
+  // accented tail inside the token.
+  const found = raw.match(/(?<![A-Za-z\u00c0-\u024f])[A-Za-z\u00c0-\u024f][A-Za-z\u00c0-\u024f0-9.+#_-]{2,30}(?![A-Za-z\u00c0-\u024f0-9])/g) ?? [];
   const out = [];
   const seen = new Set();
-  for (const marker of NOT_KNOWING) {
-    let from = 0;
-    while (true) {
-      const at = scan.indexOf(marker, from);
-      if (at === -1) break;
-      from = at + marker.length;
 
-      // Everything after the marker up to a natural stop. Capped tightly: a
-      // long tail is almost always the rest of a sentence, not the topic.
-      const tail = scan.slice(at + marker.length, at + marker.length + 80);
-      const cut = tail.split(/[。！？!?\n；;，,]/)[0];
-      let topic = accept(cut);
-      // Nothing after the marker is the commonest real form in Chinese:
-      // "Zink 我确实不知道" has the topic in front and no tail at all.
-      if (!topic) {
-        topic = accept(backwardTopic(scan, at));
-      }
-      if (!topic || seen.has(topic)) continue;
-      seen.add(topic);
-      out.push({ topic, domain: "knowledge", context: context || marker });
-    }
-  }
-  return out.slice(0, 3);
-}
+  for (const word of found) {
+    // Trailing sentence punctuation is not part of the name.
+    const clean = word.replace(/[.+#_-]+$/, "");
+    if (clean.length < 3) continue;
 
-/**
- * Signals from a search she ran herself.
- *
- * She used Tavily, so she was already chasing something. Recording the query
- * is not discovering a gap — it is keeping the receipt. That distinction is
- * why this is a lower-confidence source than `recall`, and why it never
- * proposes the same query twice in a day (`recent` filter in the caller).
- */
-export function fromSearch(evt) {
-  const { params } = evt && typeof evt === "object" ? evt : {};
-  const q = tidy(params?.query || params?.q || "");
-  const topic = accept(q);
-  if (!topic) return [];
-  // Single words are too ambiguous to be a topic ("天气", "Vulkan"). A gap
-  // needs enough shape to be recognisable a week later.
-  if (topic.length < 4) return [];
-  return [{ topic, domain: "knowledge", context: "她自己去搜的" }];
-}
+    const low = clean.toLowerCase();
+    if (seen.has(low)) continue;
+    if (COMMON.has(low)) continue;
 
-/**
- * Signals from scrolling: an unfamiliar capitalised word or a latin term.
- *
- * The weakest source by a wide margin, and the one with the loudest failure
- * mode: a scroller full of product names would otherwise mint a gap per video.
- * Two guards: only latin-script terms of 4+ characters, and only when the
- * buffer does not already look like it taught her the term (no glossary line).
- */
-export function fromBrowse(evt) {
-  const { text, known = [] } = evt && typeof evt === "object" ? evt : {};
-  const raw = String(text ?? "");
-  if (!raw) return [];
+    // The discriminator: must look like a name, not like vocabulary.
+    const looksNamed = /^[A-Z]/.test(clean) || /[0-9.+#_-]/.test(clean);
+    if (!looksNamed) continue;
 
-  const out = [];
-  const seen = new Set();
-  const latin = raw.match(/\b[A-Za-z][A-Za-z0-9.+#_-]{3,24}\b/g) ?? [];
-  // Known terms are stored as whole topics, and a topic that came from a
-  // Chinese sentence looks like `transformer 的注意力机制` — one string with a
-  // latin word buried in it. Comparing the bare word against that string never
-  // matches, so a word she had already recorded got minted again. Splitting the
-  // known set into its latin tokens is what makes the filter actually work.
-  const knownSet = new Set();
-  for (const k of known || []) {
-    const s = String(k).toLowerCase();
-    knownSet.add(s);
-    for (const w of s.match(/[a-z][a-z0-9.+#_-]{3,24}/g) ?? []) knownSet.add(w);
-  }
+    // API attribute chains (`ImageDraw.text`) are code, not names. A capitalised
+    // stem followed by a lowercase member is the shape of a method call site
+    // pasted into a log, which is where these came from.
+    if (/^[A-Z][A-Za-z0-9]+\.[a-z][a-z0-9]+$/.test(clean)) continue;
 
-  for (const word of latin) {
-    const low = word.toLowerCase();
-    if (seen.has(low) || knownSet.has(low)) continue;
-    // Skip anything that is clearly structural rather than a term.
-    if (/^(https?|www|com|html|json|true|false|null)$/i.test(word)) continue;
+    // `h264`-style model numbers explain themselves rarely and clutter the
+    // list; a bare letter plus digits is not worth an entry.
+    if (/^[a-z]\d+$/i.test(clean)) continue;
+    if (/^(.)\1+$/i.test(clean)) continue;
+
+    // Web-fetch envelopes are not names either.
+    //
+    // Measured on the first live run after restart (2026-11-06 07:40): all three
+    // first noticings were `EXTERNAL_UNTRUSTED_CONTENT`, `www.gotohui.com` and
+    // `show-819136` — the scaffolding around a fetched page, not anything inside
+    // it. She would have gone looking for the meaning of a boundary marker.
+    //
+    // Cause: `web_fetch` wraps third-party text in tags plus a source header, and
+    // extraction runs over the wrapped result rather than the page body. Filtering
+    // here covers any future tool that returns a similar envelope.
+    //
+    // ALL-CAPS with an underscore is a constant; a bare caps word (`DSH`, `DAO`)
+    // is a real name and must survive, so the underscore is required.
+    if (/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(clean)) continue;
+    // Domains and URLs. `com` is not in FILE_EXT, so the filename rule let
+    // `www.gotohui.com` straight through.
+    if (/^(?:www[.])?[a-z0-9-]+([.][a-z0-9-]+)*[.](?:com|org|net|cn|io|dev|edu|gov|co|info|xyz)([/:?#].*)?$/i.test(clean)) continue;
+    // Long lowercase pinyin runs are URL slugs, not names:
+    // `xinxiangshi_pingyuanshifanqu` is a path segment from a government site,
+    // five words glued together with underscores. A real name does not look like
+    // that in either language.
+    if (/^[a-z]{4,}(?:_[a-z]{2,})+$/.test(clean) && clean.replace(/_/g, '').length >= 12) continue;
+    // Bare markup words from fetched pages.
+    if (/^(?:raw-html|html|json|text|markdown|content|body|head|title)$/i.test(clean)) continue;
+    // Hash-like tokens: no vowel structure worth pronouncing, all hex.
+    if (/^[a-f0-9]{8,}$/i.test(clean) && !/[g-z]/i.test(clean)) continue;
+    // Generated ids: a lowercase slug glued to a long digit run (`show-819136`).
+    // Bound is 4 digits so `gpt-4` and `h264` survive — those are the sort of
+    // thing this module exists to notice.
+    if (/^[a-z]{2,12}-[0-9]{4,}$/i.test(clean)) continue;
+    // Filenames and paths are not unknowns. Measured on her real notes, this
+    // branch produced `SKILL.md`, `USER.md`, `percapita.png`, `claims_of.py`,
+    // `dafeiyu-normal.png` — her own file inventory, offered back to her as
+    // things she does not understand. The extension is the tell.
+    if (/\.[a-z0-9]{1,5}$/i.test(clean) && FILE_EXT.has(clean.split(".").pop().toLowerCase())) continue;
+    // `x.js` slips past the extension list above, so a minimal stem plus a code
+    // extension is treated as a filename. The bound is 2 characters, not 4:
+    // `node.js`, `vue.js` and `deno.ts` are product names she may genuinely not
+    // know, while `a.js` and `x.py` are always files. A stem carrying a digit or
+    // underscore (`v2.py`, `my_mod.ts`) is a file too.
+    if (/^[a-z0-9]{1,2}\.(?:js|ts|py|go|rs|c|h|sh)$/i.test(clean)) continue;
+    if (/^[a-z0-9]*[0-9_][a-z0-9_]*\.(?:js|ts|py|go|rs|c|h|sh)$/i.test(clean)) continue;
+    // Hyphenated paths she works in every day. These are her own tooling, not
+    // things she needs explained. Deliberately an allowlist of *prefixes* rather
+    // than a shape: a shape rule also swallowed `node.js` and `vue.js`, which are
+    // exactly the kind of thing this module is supposed to notice.
+    if (/^(?:workspace|agent|state|memory|lib|test|scripts|dafeiyu|openclaw)(?:[-_.][a-z0-9]+)+$/i.test(clean)) continue;
+    if (/^(?:workspace|agent|state|memory|lib|test|scripts)$/i.test(clean)) continue;
+
     seen.add(low);
-    out.push({ topic: word, domain: "word", context: raw.slice(0, 60) });
-    if (out.length >= 2) break; // two per scroll, never more
+    out.push(clean);
   }
   return out;
 }
 
-function resultText(result) {
+/**
+ * Questions in Chinese text, reduced to the thing being asked about.
+ *
+ * Returns the noun after `什么是`, or the whole question when the interrogative
+ * sits inside the clause. The whole-question form is deliberately included:
+ * measured against her own logs, the interesting unknowns were questions
+ * (`为什么不直接烤 非用 2.45GHz`), not nouns.
+ */
+export function zhQuestions(text) {
+  const raw = String(text ?? "");
+  if (!raw) return [];
+
+  const out = [];
+  const seen = new Set();
+  const nouns = [];
+
+  const push = (s) => {
+    const t = String(s).trim().replace(/^[，、。：\s「」"']+/, "").replace(/[的了呢吧啊呀嘛哦诶嗯]+$/, "");
+    if (t.length < 2 || t.length > 44) return null;
+    const low = t.toLowerCase();
+    if (seen.has(low)) return null;
+    seen.add(low);
+    out.push(t);
+    return t;
+  };
+
+  // Noun form first: `什么是 redox` yields `redox`, which is what a lookup
+  // actually needs.
+  for (const re of ZH_QUESTION) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(raw))) {
+      // The noun branch runs the same pronoun test as the sentence branch. Without
+      // it, `两万人在底下问本鱼的钥匙是什么` yielded the 15 characters before
+      // `是什么` as a thing-to-look-up, because the reversed capture happily
+      // crossed a clause boundary to fill its length budget.
+      if (/[你我他她它咱本鱼]/.test(m[1])) continue;
+      const t = push(m[1]);
+      if (t) nouns.push(t.toLowerCase());
+    }
+  }
+
+  // Whole-question form. Requires an interrogative so a plain declarative
+  // sentence ending in `?` does not qualify.
+  //
+  // The separators in ZH_WHOLE_QUESTION include ASCII space so a sentence like
+  // `为什么不直接烤 非用 2.45GHz` does not run past its own full stop and get
+  // truncated at 38 characters. See the note on that constant.
+  ZH_WHOLE_QUESTION.lastIndex = 0;
+  let q;
+  while ((q = ZH_WHOLE_QUESTION.exec(raw))) {
+    const body = q[1].trim();
+    if (!HAS_INTERROGATIVE.test(body)) continue;
+    // Sentences that are about a person, or addressed *to* someone, are
+    // conversational rather than curious. `你为什么这样` is not a gap, and
+    // neither is `两万人问我主人的钥匙` — measured on her real notes, that line
+    // came back as a curiosity about the world, which it is not.
+    // Pronouns anywhere disqualify it. Measured on her real notes, the line
+    // `两万人在底下问本鱼的钥匙是什么，本鱼留了一句…` came back as a curiosity
+    // about the world purely because the comma kept the pronoun out of the first
+    // clause. A question with `我/你/他` in it is about people, not about how
+    // something works, and the thing worth knowing from that line was `API`.
+    if (/[你我他她它咱本鱼]/.test(body)) continue;
+    // If the question merely *contains* an already-captured noun and adds no
+    // other unknown, the noun is the better entry: `redox` is searchable, the
+    // sentence is not. Only drop it when the whole body adds nothing beyond
+    // that noun.
+    const lower = body.toLowerCase();
+    const redundant = nouns.some((n) => lower.includes(n) && lower.replace(n, "").replace(/[\s什么是叫啥意思]/g, "").length < 3);
+    if (redundant) continue;
+    push(body);
+  }
+
+  return out;
+}
+
+/** All candidates worth offering from a block of prose. Capped. */
+export function names(text, { max = 3 } = {}) {
+  const out = [];
+  const seen = new Set();
+  for (const n of [...latin(text), ...zhQuestions(text)]) {
+    const k = n.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(n);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/** From a search result. Search is where she most often meets something new. */
+export function fromSearchResult(result, { max = 3 } = {}) {
+  const text = resultText(result);
+  if (!text) return [];
+  return names(text, { max });
+}
+
+/**
+ * From a comment thread.
+ *
+ * Comments are the richest text she meets while browsing, because they are
+ * written by people reacting rather than by whoever made the thing. Someone
+ * asking "这什么原理" under a video is naming a gap that the video itself did
+ * not close — which is exactly the shape of the thing worth looking up.
+ *
+ * The bar is higher than plain text: only questions, and only ones about the
+ * world rather than about the person. A comment saying "你为什么这样做" is
+ * conversation, not curiosity.
+ */
+export function fromComments(text, { max = 2 } = {}) {
+  const raw = String(text ?? "");
+  if (!raw) return [];
+  return zhQuestions(raw).slice(0, max);
+}
+
+/**
+ * From something a person said.
+ *
+ * Same rules, but capped harder. A person's sentence is usually *about* the
+ * thing already under discussion, so offering several names per message would
+ * mean offering the conversation back to her.
+ */
+export function fromSpeech(text, { max = 2 } = {}) {
+  return names(text, { max });
+}
+
+/**
+ * Flatten a tool result of any known shape into text.
+ *
+ * Tool results arrive as a plain string, as `{content:[{text}]}` for this
+ * plugin's own tools, and as arbitrary objects from harness tools. Flattening
+ * in one place keeps every caller from branching on shape.
+ */
+export function resultText(result) {
   if (!result) return "";
   if (typeof result === "string") return result;
-  // Tool results arrive as { content: [{ type, text }] } in this plugin's own
-  // tools and as plain objects from harness tools. Flatten both shapes rather
-  // than branching at every call site.
   if (Array.isArray(result?.content)) {
     return result.content
       .map((c) => (typeof c === "string" ? c : c?.text ?? ""))
@@ -319,4 +339,4 @@ function resultText(result) {
   }
 }
 
-export const INTERNALS = Object.freeze({ accept, stripQuestionTail, resultText });
+export const INTERNALS = Object.freeze({ resultText, COMMON, FILE_EXT });

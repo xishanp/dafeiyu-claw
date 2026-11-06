@@ -104,6 +104,115 @@ try {
   else ok("wants 空池时有明确措辞");
 }
 
+// ---------------------------------------------------------------- 6
+// Curiosity. The prompt and the code drifted apart badly once already: the
+// prompt told her to call `curiosity_resolve` and `curiosity_state(drop=...)`
+// while the code had stopped exporting both, so following the instructions
+// produced a tool-not-found. These checks fail loudly on that class of drift.
+{
+  let cog = "";
+  try { cog = fs.readFileSync(path.join(WS, "COGNITION.md"), "utf8"); } catch { /* ok */ }
+  if (!cog) {
+    ok("COGNITION.md 不存在，跳过好奇心检查");
+  } else {
+    // Tools the prompt names must exist in the source.
+    const named = [...cog.matchAll(/(curiosity_[a-z_]+)\s*\(/g)].map((m) => m[1]);
+    const uniq = [...new Set(named)];
+    const missing = uniq.filter((t) => !actSrc.includes(`"${t}"`));
+    if (missing.length) bad(`COGNITION.md 让调用不存在的工具：${missing.join("、")}`);
+    else if (uniq.length) ok(`COGNITION.md 提到的好奇心工具都存在（${uniq.join(" / ")}）`);
+
+    // The dead API must not creep back in.
+    const dead = ["curiosity_resolve", "curiosity_gaps"].filter((d) => cog.includes(d));
+    if (dead.length) bad(`COGNITION.md 还在用旧 API：${dead.join("、")}`);
+    else ok("COGNITION.md 没有残留旧好奇心 API");
+
+    // "resolved" would be a claim of understanding the code cannot back: the
+    // module has open / wanted / faded and nothing else.
+    if (cog.includes("curiosity_resolve")) {
+      bad("COGNITION.md 仍把「弄明白了」当成一个动作，代码里没有这个状态");
+    } else ok("COGNITION.md 没有把「弄明白了」写成动作");
+
+    // The system must never assert that she does not understand a name. Its
+    // filter compares against her diary, and a diary is not a vocabulary —
+    // `linux` is absent from her notes and she knows exactly what it is.
+    // Telling her 「你还没弄清它」 would be a false statement in her own voice.
+    if (/你到现在还没弄清|你弄不明白|你攒着没弄明白/.test(cog)) {
+      bad("COGNITION.md 替她断言「你不懂」，系统没有这个知识");
+    } else ok("COGNITION.md 没有替她断言懂或不懂");
+
+    // She has to be told that clearing false entries is the expected move,
+    // otherwise every common word that passes the shape filter stays forever.
+    if (!/curiosity_forget/.test(cog) || !/本来就知道|知道了就划掉|知道哪个/.test(cog)) {
+      bad("COGNITION.md 没讲「本来就知道的要划掉」，列表会被常见词填满");
+    } else ok("COGNITION.md 讲了划掉已知项");
+
+    // Recurrence must be described, because it is the actual mechanism that
+    // turns a noticing into a want. If the prompt omits it she will hand over
+    // every passing mention and the layer becomes a to-do generator.
+    if (!/碰到第二次|碰到过好几次|同一个东西碰到/.test(cog)) {
+      bad("COGNITION.md 没讲「反复碰到才会变成想做的事」");
+    } else ok("COGNITION.md 讲了反复碰到才升级");
+  }
+}
+
+// ------------------------------------------------ about / person.md
+{
+  const label = "【他自己说过的】";
+  const instr = (() => { try { return fs.readFileSync(path.join(WS, "AGENTS.md"), "utf8"); } catch { return ""; } })();
+  const inPrompt = instr.includes(label);
+  const inCode = fs.readFileSync(new URL("../lib/about.js", import.meta.url), "utf8").includes(label);
+  if (inPrompt && inCode) ok(`提示词和 lib/about.js 都用了 ${label}`);
+  else if (!inCode) bad(`提示词有 ${label}，但 lib/about.js 不产出它`);
+  else bad(`lib/about.js 产出 ${label}，但提示词没讲怎么用`);
+  if (instr.includes("memory/facts/person.md")) ok("提示词点明了记录写在 memory/facts/person.md");
+  else bad("提示词没说 remember_about / 自动记录落在 person.md");
+  if (/记的是他的?原话/.test(instr)) ok("提示词讲清了记原话不是下判断");
+  else bad("提示词没说清记的是原话");
+}
+
+
+// ------------------------------------------------ wander / browsed
+{
+  const cog = (() => { try { return fs.readFileSync(path.join(WS, "COGNITION.md"), "utf8"); } catch { return ""; } })();
+  const src = fs.readFileSync(path.join(HERE, "..", "index.js"), "utf8");
+  // 提示词讲了「自己去逛了」，代码就必须真的会写这条 deed。
+  if (cog.includes("自己去逛了") && /kind:\s*"browsed"/.test(src)) {
+    ok("提示词讲了「自己去逛了」，代码会写 browsed");
+  } else if (cog.includes("自己去逛了")) {
+    bad("提示词讲了「自己去逛了」，但没有任何地方写 browsed");
+  }
+  // 第二次才浮现，这是这一环的核心，两边都得说对。
+  const lib = fs.readFileSync(path.join(HERE, "..", "lib", "curiosity.js"), "utf8");
+  if (/0\.30 \* recur/.test(lib) && /第二次再碰到|第二次才浮现|碰两次/.test(cog)) {
+    ok("名字要碰两次才浮现，代码和提示词一致");
+  } else if (!/0\.30 \* recur/.test(lib)) {
+    bad("pull() 的复现系数不是 0.30，dangling 可能又永远浮现不了");
+  } else {
+    bad("提示词没说名字要碰两次才浮现");
+  }
+}
+
+// ------------------------------------------------ draw vs selfie
+{
+  const read = (f) => { try { return fs.readFileSync(path.join(WS, f), "utf8"); } catch { return ""; } };
+  const all = ["AGENTS.md", "SOUL.md", "PROACTIVE.md", "COGNITION.md"].map(read).join("\n");
+  // 「想画就画」是无条件许可，会把画图变成默认动作。主人明确要求它淡出。
+  if (/想画就画/.test(all)) bad("还有「想画就画」，画图会继续变成默认动作");
+  else ok("没有无条件的「想画就画」");
+  // 画图必须被明确降级，而不是简单删掉——删掉她就不敢画了。
+  if (/画图不是默认动作|不是随手一张|画是你的本事，不是你的日常/.test(all)) {
+    ok("画图被降为次要，不是直接删掉");
+  } else bad("画图没有被明确降级，可能又被当成默认动作");
+  // 自拍必须留着，且能独立成立。
+  const selfie = /自拍/.test(read("AGENTS.md")) && /自拍一张/.test(read("PROACTIVE.md"));
+  if (selfie) ok("自拍保留，且有可执行的指令");
+  else bad("自拍丢了或没有可执行指令");
+  // 好奇心要当主线：得有一处说出它比画图优先。
+  if (/这是最正经的一条|先去看、先去查，画放后面|画放后面/.test(all)) ok("好奇心被写成主线，画图在其后");
+  else bad("没说清好奇心比画图优先");
+}
+
 // ---------------------------------------------------------------- report
 console.log(`提示词/代码一致性检查 · ${WS}`);
 console.log("");

@@ -84,7 +84,14 @@ function distill(entry) {
   const note = String(entry.resolve_note || "").trim();
   const what = String(entry.what || "").trim();
 
-  const source = note || what;
+  // The experience itself is the memory; the resolve note is a remark about it.
+  // This used to read `note || what`, so keeping an entry with the note
+  // 「值得留着」 distilled the fact `11-06 值得留着` — a sentence recording the
+  // judgement and throwing away what was judged. Measured on a real turn: the
+  // pool held 「对方说「今天好累…」，本鱼回了「累了就歇会儿…」」 and learned.md
+  // received 「- 11-06 值得留着」. Nothing downstream can recover that, because
+  // the detail is dropped here. `what` wins; the note stays in the pool.
+  const source = what || note;
   if (!source) return "";
 
   // Strip the framing words that make a note unreadable once out of context.

@@ -5,7 +5,7 @@ const CJK = /[\u4e00-\u9fff]/;
 const CJK_RUN = /[\u4e00-\u9fff]+/g;
 const WORD = /[a-z0-9_']+/g;
 
-// Small synonym table so 「吃什么」 can reach 「米饭/火锅/奶茶」.
+// Small synonym table so 「吃什么」 can reach 「白米饭/火锅/奶茶」.
 // Keys are query-side intents; values are corpus-side words that should match.
 const SYNONYMS = {
   吃: ["饭", "菜", "火锅", "奶茶", "外卖", "零食", "好吃", "难吃", "早餐", "午饭", "晚饭", "食堂", "咖啡"],
@@ -165,9 +165,4 @@ export function score(queryMap, docMap, df, total, opts = {}) {
     if (raw.includes(opts.queryText.toLowerCase())) s += 0.4;
   }
   return s;
-}
-
-export function isCjkOnly(text) {
-  const s = String(text || "").replace(/[\s\p{P}]/gu, "");
-  return s.length > 0 && [...s].every((c) => CJK.test(c));
 }

@@ -236,11 +236,32 @@ export function scan(workspaceDir, { days = 14 } = {}) {
     for (const line of raw.split("\n")) {
       const s = line.replace(/^\s*-?\s*/, "").trim();
       if (s.length < 6 || /^#/.test(s)) continue;
+      // Only the other side of the conversation is excluded.
+      //
+      // `life-log.js` writes both sides of every exchange into the same
+      // `memory/<date>.md` this scan reads, prefixed `对方:` / `本鱼:`. The
+      // owner's lines are not evidence of anything she did — measured
+      // 2026-11-06, one of them is literally 「你多刷刷抖音」, and that had been
+      // counted as her scrolling.
+      //
+      // `本鱼:` is different: it is her own first-person speech, and "刷到一条
+      // 讲唐代烽火台的" is real evidence she saw it. Excluding both sides would
+      // be the easy version and it would throw away most of the record.
+      if (/^对方\s*[:：]/.test(s)) continue;
       const kind = classify(s);
       if (!kind) continue;
-      // 刷到 is something that passed her by, not something she did. Count the
-      // exposure so the kind is not "unexplored", but never count it as output.
-      const passive = s.includes("刷到");
+      // 「刷到」 is how she says "I saw" in Chinese. It is first person, an
+      // action she took, and counting it as passive was wrong.
+      //
+      // Measured 2026-11-06: `scroll` had exposure 46 / done 4. The 42 that were
+      // excluded as passive were lines like 「刷到一条讲唐代烽火台的」 and
+      // 「刷到个视频，拿热消笔在稻田里的照片上画画」. Her completions were being
+      // counted at 9% while she was in fact scrolling constantly, which then made
+      // `matureNovelty` keep "go try scrolling" among the top candidates forever.
+      // The rule was built for something passing her by, and 「刷到」 is not that.
+      //
+      // Keeping the mechanism, narrowed to wording that actually is passive.
+      const passive = /被推|刷过去|划过去/.test(s);
       kinds[kind].exposure += 1;
       if (!passive) kinds[kind].done += 1;
       if (!kinds[kind].last_at || `${day}` > kinds[kind].last_at) kinds[kind].last_at = day;
@@ -457,7 +478,26 @@ export function gaps(workspaceDir, { limit = 3, exclude = [], dispatchSlots = 1 
     // 0.35 at the threshold, floored at 0.12 however many times she has done it.
     // A floor, not a slope to nothing, because "I have drawn 71 times" is not a
     // reason to never draw again — it is a reason to draw sooner or later.
-    const matureNovelty = Math.max(0.12, 0.35 - 0.02 * (experienceCount - cfg.lowExperienceThreshold));
+    //
+    // MEASURED 2026-11-06, and this is why the old numbers were wrong:
+    //
+    //   mature ceiling = 0.35 x 0.5 (unknown weight) + 0 x 0.3 + (1/3) x 0.2
+    //                  = 0.242
+    //   decision threshold = 0.25
+    //
+    // The entire tier was structurally unable to reach the action line. All
+    // eleven kinds sat between 0.063 and 0.242, so `decide()` fell through to
+    // rest on every single wake, and the only line she ever saw was 「这轮
+    // 没什么等着你做的」. The pool was non-empty and completely inert — which
+    // reads as "she has nothing to do", the exact symptom this tier was added
+    // to cure. The 2026-11-05 fix cured the empty pool and left the empty wake.
+    //
+    // Raising the ceiling so the thinnest explored kind can clear the threshold
+    // once it stops being stalled. 0.42 x 0.5 = 0.21 base, plus scarcity, which
+    // puts the freshest mature kinds above 0.25 and the heavily-used ones below
+    // — so ranking still does the work of preferring what she has done least.
+    const MATURE_CEILING = 0.46;
+    const matureNovelty = Math.max(0.2, MATURE_CEILING - 0.02 * (experienceCount - cfg.lowExperienceThreshold));
 
     const unknownScore =
       reason === "unexplored"
@@ -466,8 +506,7 @@ export function gaps(workspaceDir, { limit = 3, exclude = [], dispatchSlots = 1 
           ? 0.6
           : reason === "high-failure"
             ? 0.4
-            : matureNovelty;
-    // The exposure term was calibrated on a pool that structurally could not
+            : matureNovelty;    // The exposure term was calibrated on a pool that structurally could not
     // contain mature kinds, so every member had a small exposure and
     // `exposureCount / maxExposure` served as a tiebreaker among fresh things.
     //

@@ -58,7 +58,28 @@ export function scoreCandidate(candidate, opts = {}) {
   const value = clamp01(candidate?.value);
   if (value <= 0) return 0;
 
-  const prior = priorOf(candidate?.outcomes ?? {}, opts.alpha ?? 1);
+  // `fresh` means this exact thing has no track record either way.
+  //
+  // Laplace smoothing sets that to 0.5, which is correct for a goal that has
+  // been attempted zero times but *could* fail. It is wrong for a thing that has
+  // simply never been offered to her: taking the novelty suggestion is not a
+  // coin flip she has already lost half of.
+  //
+  // Measured 2026-11-06: the thinnest activity scored 0.242 and the smoothed
+  // prior cut it to 0.121 against a 0.25 threshold, so it was discarded every
+  // single wake. The consequence is the exact opposite of what the novelty
+  // source is for — a thing she has never done can never win, so she can never
+  // start doing it, so it stays never-done. `tidy` and `idle` sat at zero for
+  // the whole life of the diary for this reason.
+  //
+  // Only exempted when there is no history at all. One success or one failure
+  // puts it back on the normal prior, so this cannot be used to launder a
+  // repeatedly-failing path.
+  const outs = candidate?.outcomes ?? {};
+  const attempts = Math.max(0, Number(outs.successes ?? 0)) + Math.max(0, Number(outs.failures ?? 0));
+  const prior = attempts === 0 && opts.freshPrior !== false
+    ? 1
+    : priorOf(outs, opts.alpha ?? 1);
   if (prior <= 0) return 0;
 
   const demote = candidate?.stalled ? (opts.stallDemote ?? 0.25) : 1;

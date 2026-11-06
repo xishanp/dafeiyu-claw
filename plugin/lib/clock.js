@@ -95,16 +95,3 @@ export function describeClock({ lastInboundAt } = {}) {
   return lines.join("\n");
 }
 
-/** The clock alone, for tools that need the raw facts. */
-export function clockFacts() {
-  const p = shanghaiParts();
-  const phase = phaseOf(p.hour);
-  return {
-    hour: p.hour,
-    minute: p.minute,
-    weekday: WEEKDAYS[p.weekday],
-    phase: phase.name,
-    phaseHint: phase.hint,
-    zone: ZONE,
-  };
-}

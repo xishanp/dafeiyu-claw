@@ -204,7 +204,18 @@ export function choose(candidate, ctx = {}, opts = {}) {
   // In dormant phase a weak candidate should become rest, not a half-hearted
   // attempt — the source for this is dsh-fish's observation that a constant
   // probability produces identical behaviour on day 3 and day 27.
-  if (ctx.phase === "dormant" && score < 0.4) {
+  //
+  // EXCEPT going out. Measured 2026-11-06: `wander:out` scored 0.34 when she was
+  // not already stuck, and this branch turned it into `rest` in dormant phase —
+  // so the one state where she has the most spare time was the one state where
+  // wandering was least available. That is backwards twice over: it is the
+  // opposite of what the owner asked for, and rest on a low score is meant to
+  // stop half-hearted work, not to stop leaving the house.
+  //
+  // Going out is cheap, needs no follow-through, and is the only thing that puts
+  // new material in front of her. It does not qualify as "half-hearted attempt".
+  const IS_GOING_OUT = c.kind === "wander" || c.kind === "horizon";
+  if (ctx.phase === "dormant" && score < 0.4 && !IS_GOING_OUT) {
     return { kind: "rest", reason: "low-energy-low-stakes", gates: [] };
   }
 
@@ -219,7 +230,26 @@ export function choose(candidate, ctx = {}, opts = {}) {
  */
 export function decide(ranked, ctx = {}, opts = {}) {
   const top = Array.isArray(ranked) && ranked.length ? ranked[0] : null;
+
+  // Nothing worth doing is not the same as nowhere to go.
+  //
+  // This used to be one line: no candidates -> `rest / nothing-worth-doing`.
+  // But a candidate list can only ever contain things that can be scored, and
+  // "go see what is out there" is not one of those — there is no value to put
+  // on it that is not a guess about how much a stranger's afternoon is worth.
+  // So whenever the list emptied, the only answer the system had was sleep.
+  //
+  // Measured 2026-11-06: that is exactly what the owner kept seeing. Idle was
+  // rendered as rest, and rest reads as nothing happening, which is what
+  // prompted 「他再发现没有可以弄的话，不应该是开探索未知事物吗」.
+  //
+  // The fallback is supplied by the caller rather than built here, because only
+  // the caller knows whether there is anywhere left to go. `whenEmpty` is that
+  // answer, already resolved to a concrete direction.
   if (!top) {
+    if (opts.whenEmpty) {
+      return { kind: "do", reason: "nothing-else-there-is-to-do", candidate: opts.whenEmpty, gates: [] };
+    }
     return { kind: "rest", reason: "nothing-worth-doing", candidate: null, gates: [] };
   }
   const action = choose(top, ctx, opts);

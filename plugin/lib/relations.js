@@ -18,7 +18,7 @@ const FILE_VERSION = 1;
 // 一次都不会执行，数值永远停在原地。2026-11-04 实测：安奈 152 次互动涨到
 // 0.947，此后不再出现，一个月后仍然是 0.947。
 //
-// 目标（2026-11-04 老大定的）：0.9 的人断联 7 天要落到 0.4 左右。
+// 目标（2026-11-04 用户定的）：0.9 的人断联 7 天要落到 0.4 左右。
 // （0.9 - 0.4）/ 7 = 0.0714/天。取 0.07。
 //
 // 对照：
@@ -288,13 +288,6 @@ export function addNote(workspaceDir, personId, text) {
 export function topPeople(workspaceDir, limit = 10) {
   const { data } = loadRelations(workspaceDir);
   return Object.values(data.people)
-    .sort((a, b) => b.familiarity - a.familiarity)
-    .slice(0, limit);
-}
-
-export function topGroups(workspaceDir, limit = 10) {
-  const { data } = loadRelations(workspaceDir);
-  return Object.values(data.groups)
     .sort((a, b) => b.familiarity - a.familiarity)
     .slice(0, limit);
 }

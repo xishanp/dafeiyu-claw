@@ -130,9 +130,15 @@ t("坏了的状态文件不回抛：当空表处理", () => {
 
 // --------------------------------------------------------------------- distill
 
-t("提炼：有 resolve_note 时优先用 note", () => {
+t("提炼：有 resolve_note 时仍以 what 为主", () => {
+  // 原来钉的是 `note || what`。但工具里 note 是「可选：为什么这样定，一句话」，
+  // 是给决定写批注的，不是事情的正文。实测 2026-11-06：keep 时 note 传
+  // 「值得留着」，learned.md 收到「- 11-06 值得留着」——把判断写成了事实，
+  // 而被判断的那件事整个丢了。所以 what 必须优先。
   const out = consolidate.distill({ what: "发生了什么", resolve_note: "想明白了这件事" });
-  assert.equal(out, "想明白了这件事");
+  assert.equal(out, "发生了什么");
+  // 没有 what 时才退回 note，否则批注就成了唯一来源。
+  assert.equal(consolidate.distill({ resolve_note: "只有批注" }), "只有批注");
 });
 
 t("提炼：去掉开头的架子词，但不动正经字", () => {
@@ -235,7 +241,7 @@ t("固化：kept 的才提炼，写进 learned.md", () => {
   assert.equal(r.ran, true);
   assert.equal(r.facts, 1);
   const text = fs.readFileSync(path.join(dir, "memory", "facts", "learned.md"), "utf8");
-  assert.match(text, /这句话本鱼认/);
+  assert.match(text, /一件值得记的事/);
   assert.match(text, /机器整理/);
 });
 
@@ -266,7 +272,7 @@ t("固化：处理过的不会重复提炼", () => {
   const r2 = consolidate.pass(dir);
   assert.equal(r2.ran, false);
   const text = fs.readFileSync(path.join(dir, "memory", "facts", "learned.md"), "utf8");
-  assert.equal(text.split("记一次就够").length - 1, 1);
+  assert.equal(text.split("只该出现一次").length - 1, 1);
 });
 
 t("固化：dropped 的不进 learned.md（丢了就是丢了）", () => {

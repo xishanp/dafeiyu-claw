@@ -230,10 +230,4 @@ export function asCandidates(proposals) {
   }));
 }
 
-/** One-line digest for logging; never injected verbatim. */
-export function summarize(proposals) {
-  if (!proposals.length) return "";
-  return proposals.map((p) => `${p.kind}(${p.salience})`).join(", ");
-}
-
 export { nowIso };

@@ -177,11 +177,74 @@ export function noteActivity(workspaceDir, target) {
 }
 
 /**
- * Decide whether a proactive impulse for this target is allowed right now.
- * This only gates STARTING a conversation. It never gates replies: an inbound
- * message always gets answered regardless of quiet hours or these gates.
- * Returns { allowed, reason, cfg }.
+ * Record that a target asked for silence (or closed the conversation).
+ *
+ * `decide.detectBoundary` has always returned "stop" / "closed" and nobody
+ * stored the answer. This is the storage half: a per-target flag with an
+ * expiry, kept in the same file as the rest of the pacing state so it moves
+ * with the conversation rather than living in a second source of truth.
+ *
+ * `stop` means "do not open toward me again until I speak"; `closed` is weaker
+ * ("this conversation ended") and expires on its own, because someone saying
+ * 拜拜 at noon has not asked for silence forever.
  */
+const BOUNDARY_TTL_MIN = { stop: 7 * 24 * 60, closed: 6 * 60 };
+
+export function noteBoundary(workspaceDir, target, kind) {
+  if (!target) return false;
+  if (kind !== "stop" && kind !== "closed") return false;
+  const { file, data } = load(workspaceDir);
+  const t = data.targets[target] || {};
+  t.boundary = kind;
+  t.boundary_at = new Date().toISOString();
+  data.targets[target] = t;
+  save(file, data);
+  return true;
+}
+
+/**
+ * What, if anything, stops us opening toward this target.
+ *
+ * Opening again after being told 不要发私信 is the one mistake that reads as
+ * not listening, so this fails closed: an expired record is cleared, a live one
+ * refuses, and no record means nothing is stopping us.
+ */
+export function boundaryFor(workspaceDir, target) {
+  if (!target) return null;
+  const { file, data } = load(workspaceDir);
+  const t = data.targets[target] || {};
+  if (!t.boundary || !t.boundary_at) return null;
+  const ageMin = (Date.now() - Date.parse(t.boundary_at)) / 60000;
+  const ttl = BOUNDARY_TTL_MIN[t.boundary] ?? 0;
+  if (!(ageMin < ttl)) {
+    delete t.boundary;
+    delete t.boundary_at;
+    data.targets[target] = t;
+    save(file, data);
+    return null;
+  }
+  return { kind: t.boundary, ageMin };
+}
+
+/**
+ * Clear the boundary because they spoke to us again.
+ *
+ * Asking for silence is not permanent: the moment they write, they have
+ * reopened the conversation themselves. Without this the flag outlives its
+ * reason, and a week-old 别发了 mutes a chat that resumed long ago.
+ */
+export function clearBoundary(workspaceDir, target) {
+  if (!target) return false;
+  const { file, data } = load(workspaceDir);
+  const t = data.targets[target] || {};
+  if (!t.boundary) return false;
+  delete t.boundary;
+  delete t.boundary_at;
+  data.targets[target] = t;
+  save(file, data);
+  return true;
+}
+
 /**
  * Is this send a spontaneous opening, or part of a live conversation?
  *
@@ -216,11 +279,17 @@ export function unlimited() {
   return { allowed: true, reason: "unlimited" };
 }
 
+/**
+ * Decide whether a proactive impulse for this target is allowed right now.
+ * This only gates STARTING a conversation. It never gates replies: an inbound
+ * message always gets answered regardless of quiet hours or these gates.
+ * Returns { allowed, reason, cfg }.
+ */
 export function evaluate(workspaceDir, target, cfgIn = {}) {
   const cfg = { ...DEFAULTS, ...cfgIn };
   // Quiet hours are checked BEFORE the unlimited shortcut on purpose.
   //
-  // 2026-11-01: 老大 said the bot must not speak between 00:00 and 06:00. The
+  // 2026-11-01: 用户 said the bot must not speak between 00:00 and 06:00. The
   // old order let `unlimited` win unconditionally, so the quiet window was dead
   // code — the config accepted it and nothing ever read it. Silence overnight is
   // a decision only the code can enforce; a prompt line can be talked out of.
@@ -379,6 +448,16 @@ export function queue(workspaceDir, o = {}, cfgIn = {}) {
 /** Take the next impulse for a target and mark it consumed. Expired items are dropped, not sent. */
 export function take(workspaceDir, target, cfgIn = {}) {
   const cfg = { ...DEFAULTS, ...cfgIn };
+  // Boundary first, before anything is spliced out of the queue.
+  //
+  // `take` is the last point before a send actually happens, and it consulted
+  // nothing at all — no quiet hours, no familiarity, no "they asked me to stop".
+  // The queue record survives the refusal on purpose: the rule is silence until
+  // they speak, not deletion of what she wanted to say.
+  if (target) {
+    const blocked = boundaryFor(workspaceDir, target);
+    if (blocked) return null;
+  }
   const { file, data } = load(workspaceDir);
   purgeExpired(data, cfg);
 

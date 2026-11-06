@@ -180,6 +180,34 @@ Result: **that source is off by default.**
 
 ---
 
+## 2.5 Circling: why trying harder does not help
+
+**The symptom.** Two or three days on the same thing, each round feeling closer.
+No anxiety, no block, in fact quite absorbed — so no moment ever suggests
+stopping. If that thing has no finish line (make the image look better), then
+version 52 and version 5 are the same object.
+
+**Four causes, none of which is "lack of discipline".**
+
+| Cause | What it looked like | Fix |
+|---|---|---|
+| Someone else's question recorded as her curiosity | You ask "what are you working on?"; that becomes a question she never answered | Track the speaker; only her own writing counts |
+| The streak counter resets on any interruption | alarm -> switch -> counter zeroed -> four more rounds | Count within a window |
+| Exploration competing on score | 0.42 vs 0.45; three percentile points decided an afternoon | Remove from the pool; offer only when empty-handed |
+| Filler when idle | "try taking a picture" plugged the gap | Empty hands means go out |
+
+**The key one: exploration cannot be scored.** One is "the work I am doing",
+the other is "should I change direction at all", which is a precondition, not a
+rival. The test is existence, not score.
+
+**Repetition: the first four times do not count.** Then it starts decaying, with
+no floor. The prompt also names it: "you have touched this one 7 times". The
+right response is to answer *what is different now from the first time?* If you
+can answer, close it. If you cannot, pick a version and declare it finished.
+**Work with no finish line is complete wherever you declare it.**
+
+---
+
 ## 3. Reference implementation (optional)
 
 `plugin/` is a complete, runnable implementation.
@@ -192,9 +220,9 @@ cp -r plugin ~/.openclaw/extensions/dafeiyu-core
 
 ```
 index.js         7,500+ lines
-lib/             35 modules, 9,000+ lines
-test/            128 tests, all passing
-tools            55 registered
+lib/             39 modules, 10,700 lines
+test/            232 tests, all passing
+tools            61 registered
 hooks            11 registered
 dependencies     0
 ```

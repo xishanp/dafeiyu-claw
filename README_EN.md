@@ -17,9 +17,9 @@
 
 <p align="center">
   <img alt="Prompts" src="https://img.shields.io/badge/Prompts-7%20files-DC2626">
-  <img alt="Reference" src="https://img.shields.io/badge/Reference%20impl-55%20tools-2563EB">
-  <img alt="Modules" src="https://img.shields.io/badge/Modules-35-7C3AED">
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-128%20passing-16A34A">
+  <img alt="Reference" src="https://img.shields.io/badge/Reference%20impl-61%20tools-2563EB">
+  <img alt="Modules" src="https://img.shields.io/badge/Modules-39-7C3AED">
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-232%20passing-16A34A">
   <img alt="Deps" src="https://img.shields.io/badge/Dependencies-0-6B7280">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-16A34A">
 </p>

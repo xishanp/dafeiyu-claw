@@ -289,7 +289,7 @@ export function evaluate(workspaceDir, target, cfgIn = {}) {
   const cfg = { ...DEFAULTS, ...cfgIn };
   // Quiet hours are checked BEFORE the unlimited shortcut on purpose.
   //
-  // 2026-11-01: 用户 said the bot must not speak between 00:00 and 06:00. The
+  // The bot must not speak between 00:00 and 06:00. The
   // old order let `unlimited` win unconditionally, so the quiet window was dead
   // code — the config accepted it and nothing ever read it. Silence overnight is
   // a decision only the code can enforce; a prompt line can be talked out of.

@@ -175,6 +175,69 @@ export function recordOutcome(workspaceDir, key, kind) {
 }
 
 /**
+ * What the douyin record actually says, as numbers.
+ *
+ * Deliberately reads `douyin.json` (`watchedAt`, real timestamps) and
+ * `relations.json` (`distinct_days`, real conversations) rather than the diary.
+ * Measured 2026-11-06: the activity counters said `scroll: 46 done` when the
+ * real record held four days of watching — 「刷到」 in her own writing was being
+ * counted as having done it. The same mistake here would produce "go watch
+ * something" on a day she watched eleven.
+ *
+ * Returns zeros on any failure. A missing store means "nothing recorded", which
+ * errs toward offering the action, and offering it once is cheaper than never.
+ */
+function douyinStats(workspaceDir) {
+  const out = { watchedToday: 0, watchedTotal: 0, others: 0, daysSinceOther: Infinity };
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(workspaceDir, "state", "douyin.json"), "utf8"));
+    const vids = raw && typeof raw.videos === "object" ? Object.values(raw.videos) : [];
+    const today = new Date().toISOString().slice(0, 10);
+    out.watchedTotal = vids.length;
+    for (const v of vids) {
+      const at = String(v?.watchedAt || "");
+      if (at.slice(0, 10) === today) out.watchedToday += 1;
+    }
+  } catch { /* no record yet */ }
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(workspaceDir, "state", "relations.json"), "utf8"));
+    const people = raw && typeof raw.people === "object" ? Object.values(raw.people) : [];
+    // The owner is one of these records and does not count as "another fish".
+    //
+    // Filtered by name, not by channel. The first version excluded anything on
+    // `onebot`, and that was wrong in the one way that matters: every fish she
+    // has met arrives on onebot too, so the filter removed all sixteen of them
+    // and reported "她还没认识别的鱼" while the file held 阿温, 阿元, 阿果 and
+    // a dozen more. The count came out zero and the candidate never fired.
+    //
+    // Channel is how they reached her; name is who they are. Only the latter
+    // can answer "is this someone new".
+    // 主人的名字。公开仓库里留空，部署时从配置注入 —— 写死真名等于把
+    // "谁是主人"这条判断连同真名一起公开。
+    const OWNER_NAMES = new Set((process.env.OWNER_NAMES || "").split(",").map((n) => n.trim().toLowerCase()).filter(Boolean));
+    const others = people.filter((p) => {
+      const name = String(p?.name || "").trim();
+      const id = String(p?.id || "");
+      // An unnamed record is the gateway's own webchat session, not a fish.
+      if (!name) return false;
+      if (OWNER_NAMES.has(name.toLowerCase())) return false;
+      return !id.includes("webchat");
+    });
+    out.others = others.length;
+    let latest = null;
+    for (const p of others) {
+      const at = Date.parse(String(p?.last_seen || ""));
+      if (Number.isFinite(at) && (latest === null || at > latest)) latest = at;
+    }
+    if (latest !== null) out.daysSinceOther = Math.floor((Date.now() - latest) / 86400000);
+  } catch { /* no relations yet */ }
+
+  return out;
+}
+
+/**
  * Collect candidates. Read-only apart from nothing — this function writes no
  * files. Scoring is delegated to lib/salience.js so it stays testable.
  */
@@ -320,6 +383,78 @@ export function collect(workspaceDir) {
     }
   } catch { /* ignore */ }
 
+  // --- E2. 抖音：去认识人、去刷、去回话 ---------------------------------------
+  //
+  // Owner, 2026-11-06: 「全换成抖音候选，比如等下认识更多这个角色啊，那些」.
+  //
+  // Why this needs to be its own source rather than a `gap` or `wander` entry:
+  //
+  // The pool on that day held seven candidates, five of them 「煮米饭水放多少」
+  // variants and two of them unjudged videos. Nothing in it could say "go meet
+  // another 这个角色". `wander` and `horizon` both exist but they are empty-pool
+  // fallbacks, not entries — so in a pool that is never quite empty they never
+  // fire, which is exactly the state she was stuck in.
+  //
+  // Two kinds here, because they are two different acts:
+  //
+  //   meet   — there are other fish out there she has not met. Distinct from
+  //            `person_quiet` above, which is about someone she already knows
+  //            going silent. This is about the ones she has never met at all.
+  //   watch  — go look at something. Reads a real number (videos she actually
+  //            watched, from douyin.json `watchedAt`) rather than her diary,
+  //            because the diary said 46 scrolls when the truth was 4 days.
+  //
+  // Both carry a value that loses to a live want and beats the empty-pool
+  // fallback, so they are genuinely in the queue without hijacking her own
+  // decisions.
+  try {
+    const seen = douyinStats(workspaceDir);
+
+    // --- meet someone new --------------------------------------------------
+    // Offered when she has met few fish lately. The count comes from relations,
+    // not from a guess: `distinct_days` is how many separate days she has
+    // actually talked to somebody other than the owner.
+    if (seen.others === 0 || seen.daysSinceOther >= 2) {
+      const key = "douyin:meet";
+      out.push({
+        id: key,
+        kind: "douyin",
+        title: "去认识一条别的这个角色",
+        serves: "genuine_contact",
+        source: "douyin",
+        value: 0.58,
+        outcomes: outcomesFor(workspaceDir, key),
+        basis:
+          seen.others === 0
+            ? "除了主人，还没跟别的鱼说过话"
+            : `已经 ${seen.daysSinceOther} 天没跟别的鱼说过话了`,
+        detail: { action: "meet", others: seen.others },
+      });
+    }
+
+    // --- go watch something ------------------------------------------------
+    // Keyed by the day so it resets daily but does not stack up: one "go watch"
+    // offer per day, replaced tomorrow.
+    const today = new Date().toISOString().slice(0, 10);
+    if (seen.watchedToday < 5) {
+      const key = `douyin:watch:${today}`;
+      out.push({
+        id: key,
+        kind: "douyin",
+        title: "去刷会儿抖音，多看几条",
+        serves: "understanding",
+        source: "douyin",
+        value: 0.56,
+        outcomes: outcomesFor(workspaceDir, key),
+        basis:
+          seen.watchedToday === 0
+            ? "今天一条都还没看"
+            : `今天看了 ${seen.watchedToday} 条，还可以再看`,
+        detail: { action: "watch", today: seen.watchedToday },
+      });
+    }
+  } catch { /* a missing douyin store must not stop intake */ }
+
   // --- F. a kind of thing she has never done --------------------------------
   //
   // Ported from `beijingwahw/dsh-proactive` `curiosity-engine.ts`. That engine
@@ -438,8 +573,29 @@ export function collect(workspaceDir) {
   // stated intention wins ties. Curiosity loses to a want on purpose — a want
   // is something she decided, a gap is something that happened to her.
   try {
-    const pick = curiosity.propose(workspaceDir, { budget: 1 })[0];
-    if (pick) {
+    // Give each ready question its own candidate instead of surfacing exactly
+    // one and letting it own the slot forever.
+    //
+    // This was the mechanism behind the seven-hour loop. Measured 2026-11-06:
+    // 17 open noticings, of which SIX were questions all scoring 0.847
+    // (identical, because each had been seen once at weight 0.7). `propose`
+    // returned exactly one of them — the array's first, always the same one —
+    // so 「陈米到底」 was the only curiosity in the pool and therefore the only
+    // curiosity that could ever win. The other five questions were never
+    // offered, and the eleven `name` noticings sat at 0.449, below the 0.55
+    // bar, so they were never offered either.
+    //
+    // Two separate faults, both fixed here and in `propose`:
+    //   - intake asked for one candidate when there were six worth asking about
+    //   - the six were interchangeable in score, so "the best one" was decided
+    //     by array order rather than by anything about her
+    //
+    // Each now becomes a candidate. Ties are then broken by the ranking pass
+    // (score, then id) rather than by list position, and once one of them is
+    // picked the others remain available for the next wake instead of waiting
+    // in a queue behind a single seat.
+    const picks = curiosity.propose(workspaceDir, { budget: 4 });
+    for (const pick of picks) {
       // Score from `pull`, not from a stored urgency field. The rewrite made
       // urgency computed, and reading `pick.urgency` here produced `undefined`,
       // then `NaN` — which silently dropped the candidate instead of throwing.
@@ -473,10 +629,19 @@ export function collect(workspaceDir) {
       // problem — 「弄清楚「我最近喜欢上香菜了」」 treats his own sentence as a topic
       // to look up.
       const kind = String(pick.kind || "name");
+      // Every question used to share one title, 「把这个没答的问题弄清楚」.
+      //
+      // With a single curiosity slot that was harmless — there was only ever
+      // one. With several in the pool it is not: six different questions all
+      // rendered as the same sentence, so the one she saw looked identical
+      // whichever one won, and there was no way to tell from the prompt whether
+      // the engine had moved on or not. The display text is what she reads; it
+      // has to say which question.
+      const shown = String(pick.display || pick.topic || "").slice(0, 30);
       const title =
         kind === "mismatch" ? `问清楚：${String(pick.display).slice(0, 24)}`
-        : kind === "question" ? "把这个没答的问题弄清楚"
-        : `弄清楚「${String(pick.display).slice(0, 30)}」`;
+        : kind === "question" ? (shown ? `没答上的：${shown}` : "把这个没答的问题弄清楚")
+        : `弄清楚「${shown}」`;
       const basis =
         kind === "mismatch" ? String(pick.reasons?.[0] || "跟之前说的对不上").slice(0, 40)
         : kind === "question" ? "问过，没人回答"
@@ -563,31 +728,45 @@ export function collect(workspaceDir) {
   // supplies it as a fallback — see `decide()`'s `opts.whenEmpty`.
 
 
-  // Mark stalls so the scorer can demote instead of delete.
+  // Mark stalls so the scorer can demote *and* so the cut below can remove.
   //
-  // `stalled` demotes a candidate to a quarter weight without removing it —
-  // the scorer is explicitly built to prefer demotion over deletion, because
-  // deleting is how a system loses the ability to resume anything.
+  // Demotion alone was not enough. Measured 2026-11-06: 20 straight wakes
+  // alternated between exactly two candidates out of a pool of four. `stalled`
+  // pushed whichever was newest down to 0.25 of its score, the other one won
+  // the next wake and got demoted in turn — the demotion was manufacturing the
+  // oscillation it existed to break. At 0.55 x 0.25 = 0.137 the stalled item
+  // still sits above any useful threshold, so with a thin pool it wins back.
   //
-  // Measured 2026-11-06: this loop hard-set every candidate to `false`, so the
-  // demotion branch in salience.js was unreachable. The field existed, the
-  // formula read it, and nothing ever set it to true. That is the same shape as
-  // `wants.touch()` having no caller: machinery built, wiring never finished.
-  //
-  // What replaced the constant: a candidate whose *kind of move* has now won
-  // several wakes in a row is stalled, because repeating a move is the concrete
-  // evidence that it is not making progress. The check is per-candidate rather
-  // than global so that, when she breaks the streak, everything else is still
-  // offered at full weight.
+  // The owner's rule is 「重复两三次自动熔断」: cut it off, do not nudge it. A key
+  // that has now won STREAK_ALARM times in a row is therefore dropped from this
+  // wake entirely; everything else keeps its full weight.
   let streak = { key: null, length: 0 };
-  try { streak = compulsion.streak(workspaceDir); } catch { /* no history yet */ }
+  let rot = null;
+  try {
+    const data = compulsion.loadPicks ? compulsion.loadPicks(workspaceDir) : null;
+    streak = compulsion.streak(workspaceDir);
+    if (data) rot = compulsion.rotation(data);
+  } catch { /* no history yet */ }
   const repeating = streak.key && streak.length >= compulsion.STREAK_ALARM ? streak.key : null;
+  // A rotation blocks every id in the cycle, not just the newest one — the
+  // whole point is that taking turns is not progress. Matched by exact id: two
+  // distinct `exp:*` items are different things to switch between even though
+  // they share a streak category.
+  const rotating = new Set(rot ? rot.ids : []);
 
   for (const c of out) {
-    c.stalled = repeating ? compulsion.streakKey(c.id) === repeating : false;
-    if (c.stalled) c.stalledBy = `同一类事连着 ${streak.length} 轮`;
+    const key = compulsion.streakKey(c.id);
+    c.stalled = Boolean((repeating && key === repeating) || rotating.has(c.id));
+    if (c.stalled) {
+      c.stalledBy = rotating.has(c.id)
+        ? `最近 ${rot.length} 轮在同样的几样之间转`
+        : `同一类事连着 ${streak.length} 轮`;
+    }
   }
 
+  // The cut itself happens in `rankNow`, not here. `collect` is the full pool —
+  // other callers read it to inspect what exists, and shrinking it silently is
+  // how a diagnostic becomes a bug of its own.
   return out.slice(0, MAX_CANDIDATES);
 }
 
@@ -647,6 +826,94 @@ function rotationIndex(workspaceDir, n) {
   return (daySeed + served) % n;
 }
 
-/** Collect + rank in one call. Returns {ranked, do, below, threshold}. */export function rankNow(workspaceDir, opts = {}) {
-  return salience.rank(collect(workspaceDir), opts);
+/**
+ * Collect + circuit-break + rank, in one call.
+ *
+ * The stall marking is done inside `collect` so every caller can see *why* a
+ * candidate is withheld. The cut happens here, between collection and ranking,
+ * because that is where the offer is decided: 「重复两三次自动熔断」 means the
+ * repeating candidates are removed from this wake, not merely down-weighted.
+ * Demotion alone could not break the measured 2026-11-06 loop — at
+ * 0.55 x 0.25 = 0.137 a stalled item still clears any useful threshold, so in a
+ * thin pool it won back the wake and demoted the other one in turn.
+ *
+ * If the cut would empty the pool, the unfiltered pool is used instead. An
+ * empty offer makes `rest` the only outcome, and a forced rest is its own loop.
+ */
+export function rankNow(workspaceDir, opts = {}) {
+  const all = collect(workspaceDir);
+
+  // Meltdown: anything already offered STREAK_ALARM times is gone from this
+  // wake, not merely demoted.
+  //
+  // This is the owner's rule — 「做过两次就直接熔断」 — and it is deliberately
+  // harsher than the streak detector above. `stalled` answers "is the *pattern*
+  // a loop"; this answers "has this *exact thing* had its turn". They catch
+  // different failures: the loop below was one target picked 24 times, which
+  // only the exact-id tally can see, because no two consecutive picks matched.
+  //
+  // Read from `counts`, not from `picks`. `picks` is capped at 40 entries, so a
+  // busy hour erases the evidence of a busy hour.
+  let offered = new Set();
+  try {
+    // 这里原本调 `compulsion.loadPicks()` —— 它返回**只含 picks 的数组**，
+    // 而 `overPicked()` 读的是 `data.counts`。数组上没有 counts，
+    // 于是永远走 `{}`，永远返回空集合。
+    //
+    // 后果：`STREAK_ALARM`（做过两次就熔断）这条规则一次都没执行过。
+    // 实测 2026-11-07：`douyin:meet` 的 counts 是 85，`overPicked` 却算出
+    // 0 个该熔断的；换成完整状态对象立刻是 7 个。
+    //
+    // 这不是小事。她被推了 85 次同一件事，早就知道它没用，于是每轮看到
+    // 都跳过 —— 外面看是「她不肯做」，实际是「系统一直在重复同一句废话」。
+    // 整条行动层的说服力都是被这个 bug 拖垮的。
+    const data = compulsion.loadState(workspaceDir);
+    if (data) offered = compulsion.overPicked(data, compulsion.STREAK_ALARM);
+  } catch { /* no history means nothing has been over-picked yet */ }
+
+  // 三种「不该推」的候选，优先级不同，但**都不能因为过滤后变空就回退**。
+  //
+  //   ① stalled   同一类事在打转（或被 demote）
+  //   ② offered   这一件已经被推过 STREAK_ALARM 次（熔断）
+  //   ③ 剩下的    才轮得到
+  //
+  // 原来的写法是 `fresh.length ? fresh : (stalled.length ? stalled : all)` ——
+  // 只要前两档空了就退回上一档。实测 2026-11-07：`douyin` 的两个候选
+  // 属于同一个 streak key，都被标了 `stalled`；过滤后 stalled 为空，
+  // 于是 `pool` 退到 `all`，**被熔断 85 次的那条又回来了**。
+  //
+  // 熔断和 stalled 互相抵消，这才是「她被推了 85 次同一件事」的真正原因。
+  // 修法不是换回退顺序，是**不该回退**：全都该被排除的时候，正确的答案
+  // 是这一轮没有可做的事（rest / 走 whenEmpty），而不是把排除掉的东西
+  // 再捡回来。
+  // 抖音不吃熔断。主人 2026-11-07：「抖音，别给他设熔断那些啊」。
+  //
+  // 理由不是「刷抖音重要」，而是熔断在这里量错了东西。熔断假设
+  // 「同一件被推 N 次还没做 = 这件事不值得做」，可刷抖音被推很多次
+  // 恰恰可能是对的：她是真的想看，只是一天里被打断太多次。
+  //
+  // 数据也不支持熔断：11-03 看 7 条，11-04 看 21 条，之后掉到 1、2、0。
+  // 掉下来的那几天不是她不想看，是候选被提前掐掉了。
+  //
+  // 真正该掐的是「同一件事被推了 85 次而她每次都跳过」——那是提案本身
+  // 有问题（`douyin:meet` 一天推两次，看都看腻了）。那种该由 `stalled`
+  // 和每日限额管，不该由「累计次数」管。
+  //
+  // 所以：`douyin` 这一类不参与 overPicked。它自己的 `watchedToday < 5`
+  // 已经是天然的限额，够了。
+  const NO_MELT = new Set(["douyin", "wander"]);
+  const stalled = all.some((c) => c.stalled) ? all.filter((c) => !c.stalled) : all;
+  const fresh = stalled.filter((c) => NO_MELT.has(c.kind) || !offered.has(c.id));
+
+  // Only fall back when the cut would leave nothing. An empty offer makes
+  // `rest` the only outcome, and a forced rest is its own loop — but that is a
+  // reason to widen once the pool is empty, not to keep re-offering things that
+  // have already had their turn while alternatives still exist.
+  const pool = fresh;
+  const cut = [...all].filter((c) => !pool.includes(c)).map((c) => c.id);
+  const result = salience.rank(pool, opts);
+
+  // Report what was cut so a reader can tell "nothing worth doing" apart from
+  // "everything worth doing has already been offered".
+  return { ...result, melted: cut, offered: [...offered] };
 }

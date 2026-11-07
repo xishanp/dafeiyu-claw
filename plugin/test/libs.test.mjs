@@ -580,7 +580,7 @@ fs.rmSync(ws2, { recursive: true, force: true });
 // --- douyin ledger: the same line must not go out twice -------------------
 const ws3 = fs.mkdtempSync(path.join(os.tmpdir(), "dafeiyu-douyin-"));
 fs.mkdirSync(path.join(ws3, "state"), { recursive: true });
-const VID = "7701221407162606409";
+const VID = "7000000000000000001";
 
 t("douyin: fresh video has nothing recorded", () => {
   const s = douyinLog.status(ws3, VID);
@@ -652,7 +652,7 @@ fs.rmSync(ws3, { recursive: true, force: true });
 // --- douyin typing tickets: no keystrokes without douyin_act --------------
 const ws4 = fs.mkdtempSync(path.join(os.tmpdir(), "dafeiyu-ticket-"));
 fs.mkdirSync(path.join(ws4, "state"), { recursive: true });
-const V4 = "7701221407162606409";
+const V4 = "7000000000000000001";
 
 t("ticket: typing without approval is refused", () => {
   const r = douyinLog.consumeLine(ws4, "本鱼就是本鱼");

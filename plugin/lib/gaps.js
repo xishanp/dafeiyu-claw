@@ -182,7 +182,7 @@ export function find(text, { prior = [], max = 3, speaker = "other" } = {}) {
   // her for something).
   //
   // Measured 2026-11-06, and this was the whole cause of a loop that survived
-  // every earlier fix: the owner wrote 「大肥鱼在干嘛呢？研究如何用电饭煲做白饭吗⚆_⚆」,
+  // every earlier fix: the owner wrote 「这个角色在干嘛呢？研究如何用电饭煲做白饭吗⚆_⚆」,
   // gaps recorded it as `question / 问了但没人答`, curiosity gave it weight 0.7,
   // and it became a candidate on every wake. She picked it three times in six
   // wakes, each run reaching the streak alarm, and the alarm could only swap in

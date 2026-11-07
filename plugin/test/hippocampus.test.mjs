@@ -173,8 +173,8 @@ t("主体：认出「」引号里的原话", () => {
 });
 
 t("主体：认出 @人和《标题》", () => {
-  const s = consolidate.subjectsOf({ what: "看了《大肥鱼日记》，@炸毛小霄 发的" });
-  assert.ok(s.some((x) => x.includes("大肥鱼日记")));
+  const s = consolidate.subjectsOf({ what: "看了《小鲸鱼日记》，@炸毛小霄 发的" });
+  assert.ok(s.some((x) => x.includes("小鲸鱼日记")));
   assert.ok(s.some((x) => x.startsWith("@")));
 });
 

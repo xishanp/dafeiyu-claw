@@ -50,6 +50,60 @@ export const ASPIRATIONS = [
 
 const ASPIRATION_IDS = new Set(ASPIRATIONS.map((a) => a.id));
 
+/**
+ * 她自己加的方向。
+ *
+ * 四个默认方向是写死的常量，这是故意的：一个装好的系统总得有起点，否则
+ * 第一次启动时她连“往哪儿走”都没有。但写死也意味着**她永远只能在四条路上
+ * 走**——她想弄明白的东西如果不在那四类里，就无处停放。
+ *
+ * 实测 2026-11-07：四个方向 `last_advanced_at` 全是 null，一个都没推进过。
+ * 四选一永远选不出新东西，因为它们本来就不是从她身上长出来的。
+ *
+ * 所以这里开一个口：她可以给自己加一条方向。不是替换默认的四条（那是
+ * 别的模块正在用的一整套坐标），是在后面添一条。
+ *
+ * 边界：
+ *   - 不是 goal。goal 是“做完就关”的事，aspiration 是“一直在那儿”的方向。
+ *   - 不能删默认的四条。删了会让 goals.serves 指向不存在的东西。
+ *   - 加进来的从 0.5 开始，和默认值一样：不预设它比别的重要。
+ *   - 最多 8 条。方向太多等于没有方向，而且每一轮都要参与比较。
+ */
+export function addAspiration(workspaceDir, { title, why = "" } = {}) {
+  const t = String(title ?? "").replace(/[\r\n]/g, " ").trim().slice(0, 40);
+  if (!t || t.length < 3) return { ok: false, reason: "太短了，说清是哪个方向" };
+
+  const data = load(workspaceDir);
+  data.aspirations = Array.isArray(data.aspirations) ? data.aspirations : [];
+
+  if (data.aspirations.length >= 8) {
+    return { ok: false, reason: "方向已经 8 条了，再加就分不清哪个在拉你" };
+  }
+
+  // 名称去重，和 goal 用同一套规则。
+  const key = goalKey(t);
+  const dup = data.aspirations.find((a) => goalKey(a.title ?? "") === key);
+  if (dup) return { ok: false, reason: `已经有了：「${dup.title}」`, id: dup.id };
+
+  const id = `own_${key.slice(0, 16)}`;
+  if (data.aspirations.some((a) => a.id === id)) {
+    return { ok: false, reason: "这个方向已经记过了" };
+  }
+
+  const rec = {
+    id,
+    title: t,
+    value: 0.5,
+    // 标记来源，好让以后分得清哪些是装上去时就有的、哪些是她自己加的。
+    source: "own",
+    why: String(why ?? "").replace(/[\r\n]/g, " ").trim().slice(0, 120) || null,
+    created_at: nowIso(),
+  };
+  data.aspirations.push(rec);
+  save(workspaceDir, data);
+  return { ok: true, aspiration: rec, total: data.aspirations.length };
+}
+
 export function goalsFile(workspaceDir) {
   return path.join(workspaceDir, "state", "goals.json");
 }
@@ -92,8 +146,7 @@ function save(workspaceDir, data) {
   fs.renameSync(tmp, file);
 }
 
-/** Normalize a title so " 做 图 " and "做图" cannot become two goals. */
-export function goalKey(title) {
+/** Normalize a title so " 做 图 " and "做图" cannot become two goals. */export function goalKey(title) {
   return String(title || "")
     .replace(/\s+/gu, "")
     .replace(/[，,。.！!？?~～…、；;：:]/gu, "")
@@ -128,14 +181,32 @@ export function isTombstoned(data, title) {
 export function create(workspaceDir, { title, serves, source, steps = [] } = {}) {
   const t = cleanTitle(title);
   if (!t) return { ok: false, reason: "目标得有一句话" };
-  if (!ASPIRATION_IDS.has(String(serves || ""))) {
-    return { ok: false, reason: `serves 必须是四条志向之一`, known: [...ASPIRATION_IDS] };
+
+  // serves 可以是默认四条之一，也可以是她自己加的方向，或者那一条的 title 原文。
+  //
+  // 原来只认写死的四个 id。后果：她就算给自己加了一个新方向（`addAspiration`），
+  // 也没办法把目标挂上去 —— 那条方向永远空着，然后因为「一直没动」被当成
+  // 薄弱方向推给她，而她无路可走。
+  const data0 = load(workspaceDir);
+  const known = Array.isArray(data0.aspirations) ? data0.aspirations : [];
+  const raw = String(serves || "");
+  const match = known.find(
+    (a) => a.id === raw || String(a.title ?? "").trim() === raw.trim(),
+  );
+  const servesId = match ? String(match.id) : null;
+  if (!servesId) {
+    const ids = known.map((a) => a.id);
+    return {
+      ok: false,
+      reason: `serves 要是已有的方向之一（或者它的 title 原文）`,
+      known: ids.length ? ids : [...ASPIRATION_IDS],
+    };
   }
   if (!["topic", "unfinish", "pressure"].includes(String(source || ""))) {
     return { ok: false, reason: `source 必须是 topic / unfinish / pressure` };
   }
 
-  const data = load(workspaceDir);
+  const data = data0;
 
   if (isTombstoned(data, t)) {
     return { ok: false, reason: "这条已经做完过了，不再重复造", tombstoned: true };
@@ -152,7 +223,7 @@ export function create(workspaceDir, { title, serves, source, steps = [] } = {})
   const goal = {
     id: `g_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
     title: t,
-    serves: String(serves),
+    serves: servesId,
     source: String(source),
     status: "active",
     created_at: nowIso(),

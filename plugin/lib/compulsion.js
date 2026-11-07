@@ -41,8 +41,16 @@ import path from "node:path";
 const STATE_FILE = "compulsion.json";
 const HISTORY_MAX = 40;
 
-/** How many identical picks in a row count as a streak. */
-export const STREAK_ALARM = 4;
+/**
+ * How many times a key may win before it counts as a loop.
+ *
+ * Owner raised this from 4 to 2 on 2026-11-06: 「重复两三次自动熔断」. The
+ * argument for the lower number is the observed case — 20 straight wakes on two
+ * targets — where the fourth pick was already two picks past the point a person
+ * would have noticed. Waiting for four guarantees at least four repeats before
+ * anything reacts.
+ */
+export const STREAK_ALARM = 2;
 
 /** How many of her own newest entries may carry 「第 N 版」 before it is a streak. */
 export const VERSION_ALARM = 3;
@@ -52,7 +60,71 @@ function file(workspaceDir) {
 }
 
 function empty() {
-  return { version: 1, updated_at: null, picks: [] };
+  return { version: 1, updated_at: null, picks: [], counts: {} };
+}
+
+/**
+ * How many times this exact id has been picked, ever.
+ *
+ * `picks` cannot answer this. It is capped at HISTORY_MAX=40, so a target she
+ * has been on for an hour pushes its own early entries out of the window and
+ * starts looking new again. Measured 2026-11-06: the history held exactly 40
+ * picks spanning 10:15→15:04, which meant the very next wake would begin
+ * discarding the evidence of the loop while the loop was still running.
+ *
+ * `counts` is a separate, uncapped tally keyed by exact id. It only grows, and
+ * it is what "picked twice already" has to mean if the rule is going to survive
+ * more than forty turns.
+ */
+export function pickCount(data, candidateId) {
+  const id = String(candidateId || "").trim();
+  if (!id) return 0;
+  const counts = data && typeof data.counts === "object" ? data.counts : null;
+  if (!counts) return 0;
+  return Math.max(0, Number(counts[id] ?? 0));
+}
+
+/**
+ * Every id that has been picked at least `n` times **recently**.
+ *
+ * This used to read `counts`, which is the lifetime tally and never decays.
+ * With STREAK_ALARM = 2 that made the cutoff permanent: any candidate offered
+ * twice was out forever, and nothing ever brought it back.
+ *
+ * Measured 2026-11-07 12:11: all twelve candidates were in `counts` with >= 2,
+ * so `rankNow` returned an empty list and the wake injected nothing at all —
+ * no proposal, no rest, just silence. From outside that reads as "she did not
+ * want to do anything". The truth was that she was allowed to do nothing.
+ * The `counts` docstring already said it was "how many times has this exact
+ * thing been offered"; using it as a brake was the mistake, not the number.
+ *
+ * Three of those twelve had been picked exactly twice and would never have
+ * been offered a third time. `gap:try` reached 2 because an internal
+ * `internal-session-effects` turn recorded a pick 17 seconds after the real
+ * wake — two records of one decision.
+ *
+ * So the brake is now a window, and the window expires. A thing she genuinely
+ * kept coming back to still melts; a thing that had its turn an hour ago does
+ * not stay buried for the rest of the day.
+ */
+export const MELT_WINDOW_MS = 3 * 60 * 60 * 1000;
+
+export function overPicked(data, n = STREAK_ALARM, { withinMs = MELT_WINDOW_MS, now = Date.now() } = {}) {
+  const picks = data && Array.isArray(data.picks) ? data.picks : [];
+  const since = Number(now) - Number(withinMs);
+  const recent = {};
+  for (const p of picks) {
+    const t = Date.parse(p?.at ?? "");
+    if (!Number.isFinite(t) || t < since) continue;
+    const id = String(p?.id ?? "");
+    if (!id) continue;
+    recent[id] = (recent[id] || 0) + 1;
+  }
+  const out = new Set();
+  for (const [id, c] of Object.entries(recent)) {
+    if (c >= n) out.add(id);
+  }
+  return out;
 }
 
 function load(workspaceDir) {
@@ -61,6 +133,23 @@ function load(workspaceDir) {
     if (raw && typeof raw === "object" && Array.isArray(raw.picks)) return raw;
   } catch { /* first run, or unreadable — a fresh history is not an error */ }
   return empty();
+}
+
+/** The raw pick history, for callers that need the sequence and not a summary. */
+export function loadPicks(workspaceDir) {
+  return load(workspaceDir).picks || [];
+}
+
+/**
+ * The whole state, not just the rolling window.
+ *
+ * `loadPicks` returns the array and drops `counts`, which is the one field the
+ * meltdown has to read. Two callers needing two different shapes from the same
+ * file is how the detector's halves drifted apart once already, so the full
+ * state gets its own named accessor rather than making callers guess.
+ */
+export function loadState(workspaceDir) {
+  return load(workspaceDir);
 }
 
 function save(workspaceDir, data) {
@@ -92,9 +181,26 @@ export function streakKey(candidateId) {
   if (i < 0) return id;
   const kind = id.slice(0, i);
   const rest = id.slice(i + 1);
-  // For curiosity the id itself is the subject, so keep it.
-  if (kind === "curiosity") return `curiosity:${rest}`;
-  // For want/topic/gap/person/pressure the prefix is the behaviour.
+
+  // Which kinds are "the subject" and which are "the behaviour"?
+  //
+  // `curiosity` and `exp` both name a specific thing. Two different `exp:*`
+  // entries are two different pieces of work — she could stop one and start
+  // another without that being a loop, and equally she could loop on one of
+  // them forever. Collapsing them to the bare kind erased that distinction.
+  //
+  // Measured 2026-11-06, and this was the bug the熔断 could not see:
+  //   exp:exp-20261106093804-92a   → "exp"
+  //   exp:exp-20261106093825-27u   → "exp"     (different work, same key)
+  // Then `rotation()` compared precise ids and found no cycle, while `stalled`
+  // matched `c.id` against the collapsed key and never matched at all. 24 wakes
+  // on one target, no cutoff, because the two halves of the detector were
+  // speaking different languages.
+  if (kind === "curiosity" || kind === "exp") return `${kind}:${rest}`;
+
+  // For want/topic/gap/person/pressure the prefix is the behaviour: two
+  // different wants are still "she keeps picking wants", and that IS the
+  // pattern worth cutting.
   return kind;
 }
 
@@ -106,8 +212,20 @@ export function recordPick(workspaceDir, candidateId, at = new Date().toISOStrin
   const key = streakKey(id);
   data.picks.push({ id, key, at });
   if (data.picks.length > HISTORY_MAX) data.picks = data.picks.slice(-HISTORY_MAX);
+
+  // The uncapped tally. Same write, different lifetime: `picks` is a rolling
+  // window for pattern detection, `counts` is the permanent record of "how many
+  // times has this exact thing been offered". Meltdown reads `counts`.
+  if (typeof data.counts !== "object" || data.counts === null) data.counts = {};
+  data.counts[id] = Math.max(0, Number(data.counts[id] ?? 0)) + 1;
+
   save(workspaceDir, data);
-  return { ok: true, key, streak: currentStreak(data.picks) };
+  return {
+    ok: true,
+    key,
+    streak: currentStreak(data.picks),
+    count: data.counts[id],
+  };
 }
 
 /**
@@ -126,9 +244,19 @@ export function recordPick(workspaceDir, candidateId, at = new Date().toISOStrin
  * Four picks, one interruption, four picks, forever. Nothing ever removed the
  * thing being repeated.
  *
- * Counting within a window instead: a key that keeps coming back is still the
- * same behaviour even when other keys are interleaved. The window is shorter
- * than the history so that a thing she genuinely returned to after a long gap
+ * The window was the fix for that, and it introduced a worse bug: it counted
+ * every pick of the key inside the window, not the run at the end. Measured
+ * 2026-11-06 on the real history — 20 wakes alternating between exactly two
+ * targets — the window held 6 of each and reported a streak of 6. Two keys
+ * alternating therefore read as a 6-strong streak, `stalled` demoted whichever
+ * one was newest to a quarter weight, and the other one won the next wake,
+ * which demoted *it* next time. The demotion was manufacturing the oscillation
+ * it was supposed to break.
+ *
+ * So: walk backwards from the newest pick and stop at the first key that
+ * differs. A true run of one key still counts, and an A/B alternation counts as
+ * 1 — which is what it is. The window is kept only as a bound on how far back
+ * the run may reach, so that a thing she genuinely returned to after a long gap
  * is not still being punished for last week.
  */
 export function currentStreak(picks, { window = 12 } = {}) {
@@ -136,7 +264,12 @@ export function currentStreak(picks, { window = 12 } = {}) {
   if (!list.length) return 0;
   const key = list[list.length - 1].key;
   const tail = list.slice(-Math.max(1, window));
-  return tail.filter((p) => p.key === key).length;
+  let n = 0;
+  for (let i = tail.length - 1; i >= 0; i -= 1) {
+    if (tail[i].key !== key) break;
+    n += 1;
+  }
+  return n;
 }
 
 /**
@@ -150,14 +283,20 @@ export function streak(workspaceDir) {
   const picks = data.picks || [];
   if (!picks.length) return { key: null, length: 0, since: null, ids: [] };
   const key = picks[picks.length - 1].key;
-  // Same window rule as `currentStreak`, so the number reported in the prompt
-  // and the number used for demotion cannot disagree.
+  // Count the run at the end, not every occurrence in the window. Same rule as
+  // `currentStreak`, so the number reported in the prompt and the number used
+  // for demotion cannot disagree — and so that an A/B alternation is reported
+  // as the run of 1 that it actually is.
   const tail = picks.slice(-12);
-  const run = tail.filter((p) => p.key === key);
+  const run = [];
+  for (let i = tail.length - 1; i >= 0; i -= 1) {
+    if (tail[i].key !== key) break;
+    run.unshift(tail[i]);
+  }
   return {
     key,
     length: run.length,
-    since: run[0].at,
+    since: run[0]?.at ?? null,
     ids: [...new Set(run.map((p) => p.id))],
   };
 }
@@ -194,6 +333,75 @@ export function versionRun(workspaceDir, { tail = 12 } = {}) {
 }
 
 /**
+ * The candidate ids that have been taking turns, if the tail is a strict rotation.
+ *
+ * A/B alternation is a loop that a run-length counter cannot see. Measured
+ * 2026-11-06: 20 straight wakes ping-ponged between two candidates out of a
+ * pool of four. Run-length read 1 every time, so nothing ever tripped, and the
+ * behaviour was identical to being stuck — same two things, nothing new.
+ *
+ * This works on exact ids, not on `streakKey` categories. Category identity is
+ * the right unit for a plain run (twelve different acreage wants are one streak
+ * of the same move) but the wrong one here: several distinct `exp:*` items share
+ * the key `exp`, so blocking by key would take out the whole pool and leave
+ * nothing to switch to. Alternation is about *these exact two things*, so it is
+ * tracked by id.
+ *
+ * Detected by asking whether the recent tail is built from a repeating short
+ * pattern. Two ids alternating period 2, three rotating period 3; both are the
+ * same failure and neither is progress. The period must be short (<= 4) and the
+ * pattern must repeat enough times that chance is not a plausible account.
+ */
+export function rotation(picks, { window = 12, maxPeriod = 4, minRepeats = 2 } = {}) {
+  const list = Array.isArray(picks) ? picks : [];
+  const tail = list.slice(-Math.max(1, window));
+  if (tail.length < 4) return null;
+  const ids = tail.map((p) => p.id);
+
+  for (let period = 2; period <= Math.min(maxPeriod, Math.floor(ids.length / 2)); period += 1) {
+    // Compare the tail against itself shifted by `period`. A rotation of that
+    // length matches everywhere except the first `period` entries, which have
+    // nothing to their left.
+    let match = 0;
+    let total = 0;
+    for (let i = period; i < ids.length; i += 1) {
+      total += 1;
+      if (ids[i] === ids[i - period]) match += 1;
+    }
+    const cycle = ids.slice(-period);
+    const distinct = new Set(cycle).size;
+    const repeats = Math.floor(ids.length / period);
+
+    // Demand exactness was wrong, and the real history shows why.
+    //
+    // 2026-11-06, last 12 picks: 9 of 10 comparisons matched at period 2. The
+    // one mismatch was a different `exp:*` and nothing else — she is plainly
+    // alternating between two things, and one substitution in the middle does
+    // not change that. Requiring 10/10 made the detector return null on a
+    // perfect-looking loop, so the ring ran 24 more wakes untouched.
+    //
+    // The bar is now "at most one break per cycle", floored at 1 so a two-cycle
+    // still cannot pass on a single lucky comparison. A single substitution is
+    // noise; two breaks mean it is not a rotation.
+    const allowedBreaks = Math.max(1, Math.floor(repeats / 2));
+    const breaks = total - match;
+    if (
+      total > 0 &&
+      breaks <= allowedBreaks &&
+      distinct === period &&
+      repeats >= minRepeats
+    ) {
+      // Name every id that participated, not just the last cycle. A rotation
+      // blocks all of them because taking turns is not progress, and blocking
+      // only the tail would let the earlier member come straight back.
+      const involved = [...new Set(ids)];
+      return { period, ids: cycle, keys: cycle.map(streakKey), length: ids.length, involved };
+    }
+  }
+  return null;
+}
+
+/**
  * One combined reading of "is she going round in circles".
  *
  * Returns `{ stuck, because, streak, versions }`. `because` is a short line
@@ -209,6 +417,17 @@ export function check(workspaceDir, opts = {}) {
   if (s.length >= (opts.streakAlarm ?? STREAK_ALARM) && s.key) {
     reasons.push(`最近 ${s.length} 轮都在做同一类事（${s.key}）`);
   }
+  // A strict rotation is the other shape of the same loop, and run-length alone
+  // cannot see it. See `rotation()` for the measured case.
+  let rot = null;
+  try {
+    const data = load(workspaceDir);
+    rot = rotation(data.picks || []);
+  } catch { /* no history */ }
+  if (rot) {
+    reasons.push(`最近 ${rot.length} 轮就在 ${rot.keys.join(" / ")} 这几样之间转`);
+  }
+
   if (v.count >= (opts.versionAlarm ?? VERSION_ALARM)) {
     reasons.push(`你自己写下的最近 ${v.count} 条里都带版次，最新一版是第 ${v.newest} 版`);
   }
@@ -218,6 +437,7 @@ export function check(workspaceDir, opts = {}) {
     because: reasons.join("；"),
     streak: s,
     versions: v,
+    rotation: rot,
   };
 }
 

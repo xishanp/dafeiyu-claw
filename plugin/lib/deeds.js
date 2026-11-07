@@ -96,8 +96,31 @@ export function describe(workspaceDir) {
   const items = recent(workspaceDir, 6);
   if (!items.length) return "";
   const now = Date.now();
-  const shown = items.map((e) => {
-    const at = Date.parse(e.at);
+
+  // Collapse consecutive repeats.
+  //
+  // Measured 2026-11-06: six consecutive browse deeds rendered as six
+  // identical lines — 「自己去逛了：browser」 six times. The section the model
+  // reads as "what I did lately" carried one fact and five copies of it, which
+  // is worse than a single line: it looks like evidence of activity while
+  // saying nothing. Consecutive same-label-same-note entries are folded into
+  // one with a count, which is what a person would write.
+  const rows = [];
+  for (const e of items) {
+    const label = KIND_LABEL[e.kind] || e.kind;
+    const note = e.note ? `：${e.note}` : "";
+    const key = `${label}${note}`;
+    const last = rows[rows.length - 1];
+    if (last && last.key === key) {
+      last.count += 1;
+      last.at = e.at;   // keep the newest timestamp
+      continue;
+    }
+    rows.push({ key, label, note, at: e.at, ok: e.ok, count: 1 });
+  }
+
+  const shown = rows.map((r) => {
+    const at = Date.parse(r.at);
     const mins = Number.isFinite(at) ? Math.floor((now - at) / 60000) : null;
     let when = "";
     if (mins !== null) {
@@ -105,10 +128,9 @@ export function describe(workspaceDir) {
       else if (mins < 24 * 60) when = `${Math.floor(mins / 60)} 小时前`;
       else when = `${Math.floor(mins / (24 * 60))} 天前`;
     }
-    const label = KIND_LABEL[e.kind] || e.kind;
-    const note = e.note ? `：${e.note}` : "";
-    const failed = e.ok === false ? "（没成）" : "";
-    return `  · ${when} ${label}${note}${failed}`;
+    const times = r.count > 1 ? `${r.count} 次 ` : "";
+    const failed = r.ok === false ? "（没成）" : "";
+    return `  · ${when} ${times}${r.label}${r.note}${failed}`;
   });
   return ["【本鱼最近做过的事】", shown.join("\n")].join("\n");
 }

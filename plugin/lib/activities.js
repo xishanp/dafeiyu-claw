@@ -76,6 +76,17 @@ export const KINDS = {
     made: false,
     ease: 0.95,
     hint: "看别人做的东西，被动也算",
+    // 刷不是技能练习，做得越多不等于“该停一停了”。
+    //
+    // 其余十一种都用成熟衰减打分：`0.46 - 0.02 * (done - 2)`，做得越多次分
+    // 越低。对一个手艺这是对的——画到第六十张，不必再提醒她去画。对刷抖音
+    // 这是反的：她刷了 46 次，得分掉到 0.104，在十二种里排倒数第二，于是每
+    // 一轮推荐的都是 `shoot`（0.297, done=2），她刷两条就被叫走去拍照片。
+    //
+    // 她的日记里正好记着刷到了什么：「撞见一条讲原子力显微镜的……今天是头一
+    // 次看到「承担」两个字长什么样」。这不是练手，是见世面，而见世面没有
+    // “做够了”这一说。所以它不参与衰减，固定给一个能赢的分。
+    steady: 0.62,
   },
   read: {
     label: "读点东西",
@@ -263,11 +274,63 @@ export function scan(workspaceDir, { days = 14 } = {}) {
       // Keeping the mechanism, narrowed to wording that actually is passive.
       const passive = /被推|刷过去|划过去/.test(s);
       kinds[kind].exposure += 1;
-      if (!passive) kinds[kind].done += 1;
+      // `scroll` is the one kind whose done-count must come from a record she
+      // does not write herself. Measured 2026-11-06: exposure 46 / done 46 in
+      // the diary, while `state/douyin.json` held 30 videos and had stopped
+      // growing after 11-04. She was writing 「刷到一条…」 without opening the
+      // app, and the diary — her own prose — was the only evidence. A counter
+      // that can be satisfied by describing the act is not a counter of acts.
+      //
+      // So for `scroll` the diary still counts exposure (she talked about it)
+      // but never done. Done is credited in `creditScroll()` from real
+      // `watchedAt` rows.
+      if (!passive && kind !== "scroll") kinds[kind].done += 1;
       if (!kinds[kind].last_at || `${day}` > kinds[kind].last_at) kinds[kind].last_at = day;
     }
   }
 
+  data.kinds = kinds;
+  data.updated_at = new Date().toISOString();
+  save(workspaceDir, data);
+  return data;
+}
+
+/**
+ * Credit `scroll` from the only record she cannot author: the videos actually
+ * opened. Called after `scan`, and idempotent — it recounts from the file each
+ * time instead of incrementing, so a second call on the same day is a no-op.
+ *
+ * The unit is "a day on which she really watched something", not "a video".
+ * One evening of nine videos is one outing; counting videos would let a single
+ * long session outscore nine separate days of actually going out.
+ */
+export function creditScroll(workspaceDir) {
+  const data = load(workspaceDir);
+  const kinds = data.kinds || {};
+  // Standalone callers (a test, or a first run before any diary scan) have no
+  // entry yet. Creating it here keeps the function total instead of silently
+  // returning nothing, which is how a credit turns into a permanent zero.
+  if (!kinds.scroll) {
+    kinds.scroll = { exposure: 0, done: 0, failed: 0, noted: 0, last_at: null };
+  }
+  const scroll = kinds.scroll;
+
+  const days = new Set();
+  try {
+    const raw = fs.readFileSync(path.join(workspaceDir, "state", "douyin.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    for (const v of Object.values(parsed.videos || {})) {
+      const at = v && v.watchedAt;
+      if (typeof at === "string" && at.length >= 10) days.add(at.slice(0, 10));
+    }
+  } catch { /* no douyin history yet — that is a real zero, not an error */ }
+
+  scroll.done = days.size;
+  if (days.size) {
+    scroll.last_at = [...days].sort().at(-1);
+  } else {
+    scroll.last_at = null;
+  }
   data.kinds = kinds;
   data.updated_at = new Date().toISOString();
   save(workspaceDir, data);
@@ -499,8 +562,19 @@ export function gaps(workspaceDir, { limit = 3, exclude = [], dispatchSlots = 1 
     const MATURE_CEILING = 0.46;
     const matureNovelty = Math.max(0.2, MATURE_CEILING - 0.02 * (experienceCount - cfg.lowExperienceThreshold));
 
+    // A kind flagged `steady` does not decay with use.
+    //
+    // Decay answers "is this skill under-exercised". Watching other people's
+    // work is not a skill, and the amount of it done says nothing about whether
+    // there is anything left to see — so the mature tier's whole premise does
+    // not apply. See the `scroll` entry in KINDS for the measurement.
+    const steady = Number(def.steady);
+    const hasSteady = Number.isFinite(steady) && steady > 0;
+
     const unknownScore =
-      reason === "unexplored"
+      hasSteady
+        ? 1
+        : reason === "unexplored"
         ? 1
         : reason === "low-experience"
           ? 0.6
@@ -520,12 +594,13 @@ export function gaps(workspaceDir, { limit = 3, exclude = [], dispatchSlots = 1 
     // Zeroing it for mature kinds only. For `unexplored` and `low-experience`
     // the value is untouched, so behaviour inside the original engine's domain is
     // bit-for-bit what it was.
-    const exposureScore = reason === "mature" ? 0 : exposureCount / maxExposure;
+    const exposureScore = hasSteady ? 0 : (reason === "mature" ? 0 : exposureCount / maxExposure);
     const scarcityScore = 1 / (1 + explorationCount);
-    const noveltyScore =
-      unknownScore * cfg.noveltyUnknownWeight +
-      exposureScore * cfg.noveltyExposureWeight +
-      scarcityScore * cfg.noveltyScarcityWeight;
+    const noveltyScore = hasSteady
+      ? steady
+      : unknownScore * cfg.noveltyUnknownWeight +
+        exposureScore * cfg.noveltyExposureWeight +
+        scarcityScore * cfg.noveltyScarcityWeight;
 
     scored.push({
       kind,
@@ -537,6 +612,10 @@ export function gaps(workspaceDir, { limit = 3, exclude = [], dispatchSlots = 1 
       failed: Number(st.failed) || 0,
       ease: def.ease ?? 0.5,
       reason,
+      // Carried so the caller can tell a do-it-again kind from a skill whose
+      // score decayed. Without it `index.js` has no way to know that
+      // 「最没碰的是刷一会儿」 is the wrong sentence for this one.
+      steady: hasSteady ? steady : null,
       // How long since the diary last recorded this kind. `null` when unknown,
       // never a guess: the wording downstream changes based on this, and an
       // invented number would make the sentence false.

@@ -28,7 +28,7 @@ flowchart TB
 
     BPB --> Hook
     Hook --> Model["模型"]
-    Model --> Tools["55 个工具"]
+    Model --> Tools["78 个工具"]
     Tools --> State["状态层"]
     State --> Cron
 
@@ -180,7 +180,7 @@ for (let i = list.length - 1; i >= 0; i--) {
 
 ### 为什么提示词是独立文件
 
-`prompt-COGNITION.md`（20 KB）放规则：每个工具干什么、什么时候不用、什么算正当结果。
+`prompt-COGNITION.md`（36 KB）放规则：每个工具干什么、什么时候不用、什么算正当结果。
 放在代码外面，意味着行为可以重写而不动运行时，代码可以重构而不改她的性格。
 
 它由插件注入，而不是当作引导上下文加载——OpenClaw 只自动加载工作区里固定白名单
@@ -189,17 +189,48 @@ for (let i = list.length - 1; i >= 0; i--) {
 
 ### 工具是干什么的
 
-五十五个工具，按它们碰的状态分组：
+七十八个工具，按它们碰的状态分组：
 
 ```
-emotion_state · emotion_nudge            情绪
-remember_about · recall_about · who_is   事实与人
-want_do · activity_state                 她自己的意图与历史
-recall_links                             记忆遍历
-note_diary · note_self · note_effect     写回
-goal_add · goal_step · goal_close        长期目标
-intent_outcome · experience_resolve      闭环
-dafeiyu_voice · dafeiyu_sticker          表达
+emotion_state · emotion_nudge                        情绪
+remember_about · recall_about · who_is · note_about  事实与人
+topic_state · pull_away                              话题与距离
+want_do · activity_state                             她自己的意图与历史
+recall_links                                         记忆遍历
+note_diary · note_self · note_effect                 写回
+goal_add · goal_step · goal_close                    长期目标
+set_aspiration · self_state                          方向与自我
+intent_outcome · experience_resolve · fact_reject    闭环
+effect_state                                         效果账本
+curiosity_state · curiosity_want · curiosity_forget  好奇
+horizon_state · horizon_visit                        空白地图
+proactive_state · proactive_want                     主动开口
+dafeiyu_voice · dafeiyu_sticker · dafeiyu_show      表达
+dafeiyu_new_sticker                                  表情入库
+
+dafeiyu_stuck                                        自查：我是不是在打转
+dafeiyu_tune                                         调参：十个白名单键
+dafeiyu_expect                                       预测：猜了会怎样
+dafeiyu_habits · dafeiyu_interests                   看习惯与兴趣
+dafeiyu_interest                                     加一个兴趣
+need_help                                            缺东西 / 机制坏了 / 我不懂
+
+douyin_plan · douyin_record · douyin_act             看视频
+douyin_status · douyin_reply · check_inbox           抖音闭环
+
+qq_group_info · qq_members · qq_whois                群信息
+qq_mute · qq_kick · qq_set_card · qq_leave           群管理
+qq_around · qq_at · qq_online · qq_profile           在场
+qq_qzone · qq_like · qq_poke · qq_react              社交动作
+qq_notice · qq_friends · qq_groups · qq_recent       查
+qq_history                                           翻记录
+qq_hold_grudge · qq_recall_grudge                    记原话
+
+grow · growth_state · my_evolutions                  自己长东西
+sleep_review                                         睡前复盘
+propose_skill · pending_skills                       技能提议
+
+dafeiyu_approve · dafeiyu_requests · dafeiyu_proactive_take   main 侧
 ```
 
 工具是模型「写」的方式，注入是它「读」的方式，两边走同一批状态文件。

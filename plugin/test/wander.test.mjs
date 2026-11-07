@@ -74,3 +74,40 @@ test("wander: 认识的词不会被当成没见过的", () => {
   const ws = tmp();
   assert.equal(curiosity.notice(ws, "Vulkan", { known: ["Vulkan"] }), null);
 });
+
+test("wander: 见过两次的，五天后仍能浮现（整段新鲜期都有效）", () => {
+  // 2026-11-07 实测的缺陷：旧公式 sqrt(seen)/2 下，seen=2 在 age 0 是 0.554，
+  // 到 0.2 天就跌破 0.55 —— 早上看见，晚上想起来时已经不合格。
+  // FRESH_DAYS 是 5，整段窗口都该有效，不是前五个小时。
+  for (const d of [0, 1, 3, 5]) {
+    const n = { kind: "dangling", weight: 0.35, seen: 2, moved: 0, last_seen_at: ago(d) };
+    const p = curiosity.pull(n);
+    assert.ok(p >= 0.55, `见过两次、${d} 天前，应能浮现，实际 ${p.toFixed(3)}`);
+  }
+});
+
+test("wander: 见过一次的，就算刚看见也不浮现", () => {
+  // 上一条放宽了窗口，这条守住另一端：第一次遇见仍然安静。
+  // 两条一起才能锁住 recur 的形状 —— 单看任一条都可能被常数糊弄过去。
+  for (const d of [0, 1, 3, 5]) {
+    const n = { kind: "dangling", weight: 0.35, seen: 1, moved: 0, last_seen_at: ago(d) };
+    const p = curiosity.pull(n);
+    assert.ok(p < 0.55, `见过一次、${d} 天前，不该浮现，实际 ${p.toFixed(3)}`);
+  }
+});
+
+test("wander: 见过两次的（即使五天前）要压过刚见过一次的", () => {
+  // 这条锁的是排序，不是数值。
+  //
+  // 只有当「两天前见过两次」排在「刚才见过一次」前面时，才存在某一个门槛
+  // 能同时做到两件事：放进来过的，挡住第一次的。旧曲线下这两者分别是
+  // 0.554（age 0）和 0.450（age 0），排序对；但 seen=2 到第 5 天只剩 0.446，
+  // 反而低于「刚见过的第一次」的 0.450 —— 排序翻转，任何单一门槛都会
+  // 同时放错或同时挡住。这才是 wanted:0 的算术原因。
+  const twiceOld = curiosity.pull({ kind: "dangling", weight: 0.35, seen: 2, moved: 0, last_seen_at: ago(5) });
+  const onceFresh = curiosity.pull({ kind: "dangling", weight: 0.35, seen: 1, moved: 0, last_seen_at: now() });
+  assert.ok(
+    twiceOld > onceFresh,
+    `见过两次（5 天前）${twiceOld.toFixed(3)} 应高于 见过一次（刚才）${onceFresh.toFixed(3)}`,
+  );
+});

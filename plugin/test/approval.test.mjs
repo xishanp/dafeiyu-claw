@@ -45,7 +45,7 @@ t("email is masked", () => {
   assert.ok(ap.redact("mail user@example.com now").includes("<redacted-email>"));
 });
 t("chinese id and phone are masked", () => {
-  const out = ap.redact("手机 13812345678 身份证 110101199003071234");
+  const out = ap.redact("手机 13800000000 身份证 110101199000000004");
   assert.ok(out.includes("<redacted-phone>"), out);
   assert.ok(out.includes("<redacted-id>"), out);
 });

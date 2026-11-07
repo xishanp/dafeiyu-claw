@@ -221,10 +221,15 @@ function readStruggles({ goals, topics, produced7d, said7d }) {
     }
   }
 
-  const topicRows = Array.isArray(topics?.topics) ? topics.topics : [];
+  // 真实字段名是 `open_topics`。读 `topics` 永远得到空数组，所以「悬了很久的事」
+  // 这一条自述从来没能出现过 —— 而它正是 COGNITION 里说的盲区：一件悬了很久
+  // 的事不会自己跑出来说自己悬了很久。2026-11-07 实测：文件里 6 条 open。
+  const topicRows = Array.isArray(topics?.open_topics)
+    ? topics.open_topics
+    : Array.isArray(topics?.topics) ? topics.topics : [];
   for (const tp of topicRows) {
     if (!tp || tp.state === "closed") continue;
-    const last = Date.parse(tp.lastAt ?? tp.createdAt ?? "");
+    const last = Date.parse(tp.last_at ?? tp.lastAt ?? tp.createdAt ?? "");
     if (!Number.isFinite(last)) continue;
     const days = Math.floor((Date.now() - last) / 86400000);
     if (days >= STALE_DAYS) {
@@ -280,6 +285,15 @@ function renderLine(s) {
     bits.push(s.struggles[0]);
   }
 
+  // 成绩。只在真的试过几次之后才说 —— 两三次的命中率不说明什么，
+  // 说出来反而像在给自己打分。五条起算。
+  const tried = Number(s.ability.tried_recent ?? 0);
+  const rate = s.ability.hit_rate;
+  if (tried >= 5 && typeof rate === "number") {
+    if (rate >= 0.7) bits.push(`${tried} 件里成了 ${s.ability.hit_ok} 件`);
+    else if (rate <= 0.3) bits.push(`${tried} 件里只成了 ${s.ability.hit_ok} 件`);
+  }
+
   // The starving direction, if one is clearly behind the others.
   const starving = s.pursuits[0];
   if (starving && starving.value < 0.5) {
@@ -306,6 +320,7 @@ export function refresh(workspaceDir, deps = {}) {
   const effects = read(path.join(stateDir, "effects.json")) ?? {};
   const deeds = read(path.join(stateDir, "deeds.json")) ?? {};
   const topics = read(path.join(stateDir, "topics.json")) ?? {};
+  const outcomes = read(path.join(stateDir, "outcomes.json")) ?? {};
 
   // go through goals.js rather than reading the file: on a fresh install
   // goals.json does not exist yet, and goals.load() supplies the four default
@@ -334,6 +349,40 @@ export function refresh(workspaceDir, deps = {}) {
 
   const pursuits = readPursuits(goals);
   const struggles = readStruggles({ goals, topics, produced7d, said7d });
+
+  // 成绩，不只是产量。
+  //
+  // 这张卡以前只数「做了多少」（produced_7d），分不出「做出来的东西里几样是
+  // 真的」。后果：2026-11-07 那晚她把一个幻觉当成果写了半天日记、查了一整个
+  // 早上，最后自己发现那个号从没见过 —— 这件事对自我认知的冲击，卡片上一个
+  // 字都没记，因为它的记录里只多了一条「看视频」和一条「写笔记」。
+  //
+  // 只数明确有结果的：success / failure / silent。`uncertain` 不进分母 ——
+  // 还没结果是常态，把它算成失败会让命中率毫无意义。
+  //
+  // 但要排掉「记账」类的 success。`experience_resolve` 把 `drop` 也记成
+  // success（判定一件事不值得留也是完成了一次判断，这个记法本身是对的），
+  // 可它不是「做成了一件事」。实测 2026-11-07：57 条里 54 条 success，
+  // 算出来命中率 100%，而那 54 条大半是「把一条抖音记录归了档」。
+  // 拿这个当「试的 30 件全成了」是自欺。
+  const BOOKKEEPING_KINDS = new Set(["experience"]);
+  const isBookkeeping = (r) => {
+    if (BOOKKEEPING_KINDS.has(String(r?.kind ?? ""))) return true;
+    const via = String(r?.detail?.via ?? "");
+    return via === "experience_resolve" || via === "intent_outcome";
+  };
+
+  const outcomeRows = Array.isArray(outcomes.records) ? outcomes.records.slice(-60) : [];
+  let hitOk = 0;
+  let hitNo = 0;
+  for (const r of outcomeRows) {
+    if (isBookkeeping(r)) continue;
+    const m = String(r?.measured ?? "");
+    if (m === "success") hitOk += 1;
+    else if (m === "failure" || m === "silent") hitNo += 1;
+  }
+  const tried = hitOk + hitNo;
+
   const phase = readPhase({ produced7d, produced30d, said7d, struggles, hasHistory: stamps.length > 0 });
 
   const prev = load(workspaceDir);
@@ -352,6 +401,11 @@ export function refresh(workspaceDir, deps = {}) {
       output_ratio: clamp01(said7d + produced7d === 0
         ? 0
         : produced7d / (said7d + produced7d)),
+      // null 而不是 0：一次都没试过和每次都失败不是同一件事。
+      hit_rate: tried > 0 ? hitOk / tried : null,
+      tried_recent: tried,
+      hit_ok: hitOk,
+      hit_no: hitNo,
     },
     pursuits: pursuits.slice(0, 4),
     struggles,

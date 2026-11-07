@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
 // 复刻 index.js 里的实现（模块级函数，未导出）
 const squash = (v) => String(v ?? "").replace(/[\s，,。.！!？?~～…、]/gu, "");
@@ -80,6 +81,61 @@ t("超窗口后不再压", () => {
   M.clear(); mark(K, "说完了");
   M.get(K).at = Date.now() - 200000;
   assert.equal(chk(K, "嗯").drop, false);
+});
+
+console.log(`\n${pass} passed, ${fail} failed`);
+if (fail) process.exit(1);
+
+// ---------------------------------------------------------------------------
+// 否定动词不是指令
+//
+// 2026-11-06 20:54 实测：她发完语音后写「语音已经发出去了，本鱼不再打字重复一遇。」，
+// 那是给自己看的说明，却在聊天里当成正文发出去了。原因是指令词表里的「再」命中了
+// 「不再」，判成 actionable。也就是说：她在遵守规则，过滤器把她的遵守当成了指令。
+//
+// 下面直接读 index.js 的真实实现，避免复刻漂移。
+const SRC = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+const LINES = SRC.split("\n");
+
+const negLine = LINES.find((l) => l.trimStart().startsWith("const NEGATED_VERB ="));
+assert.ok(negLine, "index.js 里找不到 NEGATED_VERB");
+const NEGATED_VERB = eval(negLine.match(/=\s*(\/.*\/[a-z]*)/)[1]);
+
+const kStart = SRC.indexOf("const KEEP_IF_MATCHES = [");
+const kEnd = SRC.indexOf("];", kStart);
+const KEEP = eval("[" + SRC.slice(kStart + "const KEEP_IF_MATCHES = [".length, kEnd) + "]");
+
+const hasInstructionWord = (raw) =>
+  KEEP.some((re) => re.test(String(raw ?? "").replace(NEGATED_VERB, "")));
+
+t("旁白里的「不再」不算指令", () => {
+  assert.equal(hasInstructionWord("语音已经发出去了，本鱼不再打字重复一遇。"), false);
+  assert.equal(hasInstructionWord("本鱼不再打字重复一遍"), false);
+  assert.equal(hasInstructionWord("本鱼不打字重复了"), false);
+  assert.equal(hasInstructionWord("下回不带了"), false);
+  assert.equal(hasInstructionWord("不用了谢谢"), false);
+});
+
+t("真指令一条不能误杀", () => {
+  assert.equal(hasInstructionWord("记得先把 config 改到 8080"), true);
+  assert.equal(hasInstructionWord("要不要再发一条"), true);
+  assert.equal(hasInstructionWord("端口是 8080"), true);
+  assert.equal(hasInstructionWord("文件在 /tmp/a.txt"), true);
+  assert.equal(hasInstructionWord("别忘了我说的"), true);
+  assert.equal(hasInstructionWord("我需要再看一遍"), true);
+  assert.equal(hasInstructionWord("先做这个再做那个"), true);
+});
+
+t("「不必再跑一遍」是给听话人的，保留", () => {
+  // 否定只剥「不必」，「再跑」仍在，属于对别人的指令，不该当旁白吞掉。
+  assert.equal(hasInstructionWord("不必再跑一遍"), true);
+});
+
+t("反向验证：去掉否定剔除，这条必须变回 true", () => {
+  // 防止未来有人删掉 replace 而测试仍然通过。
+  const naive = (raw) => KEEP.some((re) => re.test(String(raw ?? "")));
+  assert.equal(naive("语音已经发出去了，本鱼不再打字重复一遍。"), true);
+  assert.equal(hasInstructionWord("语音已经发出去了，本鱼不再打字重复一遍。"), false);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -44,9 +44,12 @@ import fs from "node:fs";
 import path from "node:path";
 
 import * as attention from "./workspace.js";
+import * as revisit from "./revisit.js";
+import * as interest from "./interest.js";
 import * as selfState from "./self.js";
 import * as proposals from "./proposals.js";
 import * as goalsLib from "./goals.js";
+import * as curiosity from "./curiosity.js";
 
 // --------------------------------------------------------------------- config
 
@@ -120,7 +123,23 @@ export function observe(workspaceDir) {
   const effects = readJson(statePath(workspaceDir, "effects.json")) ?? {};
   const deeds = readJson(statePath(workspaceDir, "deeds.json")) ?? {};
   const topics = readJson(statePath(workspaceDir, "topics.json")) ?? {};
+  // 真实文件里的键是 `open_topics`（见 lib/topics.js:28）。这里读 `topics`
+  // 读到的是 undefined，这个字段就永远是空数组 —— 于是「悬着的事」这个
+  // 候选从来没进过竞争，self 卡也算不出还有几件事没落地。
+  // 2026-11-07 实测：文件里 6 条 open，快照读到 0 条。
+  const openTopics = Array.isArray(topics.open_topics)
+    ? topics.open_topics
+    : Array.isArray(topics.topics) ? topics.topics : [];
   const events = readJson(statePath(workspaceDir, EVENT_FILE)) ?? {};
+  // 好奇心池和经验池也是候选来源 —— 不只是另外两块要单独注入的文字。
+  //
+  // 之前这里是割裂的：这两个池子各自在自己的注入块里出现，从不参与
+  // `compete`。于是「她碰到一个没弄明白的名字」和「手上那件事」永远比不了
+  // 孰轻孰重 —— 一个靠固定位置插入提示词，一个靠评分，两套标准。
+  //
+  // 读文件失败就是空数组：一个池子坏掉不该让整轮快照崩。
+  const curiosityRaw = readJson(statePath(workspaceDir, "curiosity.json")) ?? {};
+  const experienceRaw = readJson(statePath(workspaceDir, "experience-pool.json")) ?? {};
 
   let goals = { aspirations: [], goals: [] };
   try { goals = goalsLib.load(workspaceDir); } catch { /* optional */ }
@@ -138,10 +157,21 @@ export function observe(workspaceDir) {
     at: nowIso(),
     effects: Array.isArray(effects.entries) ? effects.entries : [],
     deeds: Array.isArray(deeds.entries) ? deeds.entries : [],
-    topics: Array.isArray(topics.topics) ? topics.topics : [],
+    topics: openTopics,
     goals,
     self,
     events: Array.isArray(events.events) ? events.events : [],
+    // Only what is still alive. `faded` and `dropped` are settled history and
+    // have no business competing for this turn's attention.
+    //
+    // Each one carries its `pull` score computed once here, so the scoring rule
+    // stays in `curiosity.pull` — recomputing it in `notice` would be a second
+    // implementation that drifts.
+    curious: (Array.isArray(curiosityRaw.noticings) ? curiosityRaw.noticings : [])
+      .filter((n) => n && n.status === "open" && !n.want_id)
+      .map((n) => ({ ...n, pullScore: curiosity.pull(n) })),
+    pending: (Array.isArray(experienceRaw.entries) ? experienceRaw.entries : [])
+      .filter((e) => e && e.status === "pending"),
   };
 }
 
@@ -165,6 +195,9 @@ export function notice(snapshot, opts = {}) {
     affect = null,      // { name, value } — already translated to Chinese
     extra = [],         // M4 proposals
     now = Date.now(),
+    // 只有 `revisit` 那一支需要读盘（回访数据不在 snapshot 里，它一天才算一次）。
+    // 其余候选都从 snapshot 来，保持纯函数。传 null 时那一支直接跳过。
+    workspaceDir = null,
   } = opts;
 
   const out = [];
@@ -256,11 +289,36 @@ export function notice(snapshot, opts = {}) {
   }
 
   // --- 4. the oldest unresolved topic --------------------------------------
+  //
+  // 门槛 12 小时 → 2 小时。2026-11-07 实测：
+  //
+  //   15 条 open_topics，全部落在 0.4–9.4 小时之间，
+  //   过 0.5 天（12 小时）门槛的：0 条。
+  //
+  // 也就是说这个来源在生产里**从来没产出过候选**。当初定 0.5 天是为了
+  // 避免“刚说完的话立刻被翻出来”，但代价是“九小时前没聊完的事也不算”，
+  // 而那正是这个话题池存在的理由。
+  //
+  // 2 小时是折中：足够让她不在一轮之内重复自己，又短到当天的事当天能回来。
+  // 真正的防重复不靠这道门 —— `recent` 窗口已经会把刚选过的压下去。
+  const TOPIC_MIN_HOURS = 2;
+  const TOPIC_MIN_HEAT = 0.25;
   const openTopics = s.topics.filter((t) => t?.state !== "closed");
   if (openTopics.length) {
     const aged = openTopics
       .map((t) => ({ ...t, days: daysSince(t.lastAt ?? t.last_at ?? t.createdAt) }))
-      .filter((t) => t.days !== null && t.days >= 0.5)
+      .filter((t) => t.days !== null && t.days * 24 >= TOPIC_MIN_HOURS)
+      // 热度也要够。只按「放了多久」排序，结果就是最老的最响 ——
+      // 2026-11-07 实测：过了 2 小时门槛的 8 条里，heat 全是 0.11–0.12，
+      // 那些是早就不重要、只是没人关掉的话题。放得久不等于还重要。
+      //
+      // 0.25 是「还值得提」的下限。话题的 heat 每小时代谢，
+      // 掉到 0.12 说明已经凉透了，再提就是翻旧账。
+      .filter((t) => {
+        const h = t.heat;
+        // 没有 heat 字段的老数据不因此被排斥。
+        return h == null || Number(h) >= TOPIC_MIN_HEAT;
+      })
       .sort((a, b) => b.days - a.days);
     if (aged.length) {
       const t = aged[0];
@@ -276,6 +334,61 @@ export function notice(snapshot, opts = {}) {
       });
     }
   }
+
+  // --- 4a. 她在追的那类事，正好撞上了一个新东西 -----------------------------
+  //
+  // 这是兴趣真正起作用的地方：不是让她「记住自己喜欢什么」，而是让
+  // **跟她的兴趣贴得上的候选获得一点加成**。
+  //
+  // 加成幅度故意小（最多 +0.10）。兴趣应该提高概率，不该决定结果 ——
+  // 一个 0.58 的东西如果因为贴兴趣就在 0.30 的东西上面，那不是兴趣，
+  // 那是一条硬规则，而硬规则会让她只会做同一件事。
+  if (workspaceDir) {
+    try {
+      const pool = [];
+      for (const c of out) {
+        const text = `${c.text ?? ""} ${c.label ?? ""}`;
+        const a = interest.affinity(workspaceDir, text, { now });
+        if (a.score > 0.08) {
+          c.salience = Math.min(1, Number(c.salience ?? 0) + 0.10 * a.score);
+          c.interestedIn = a.matched[0]?.name ?? null;
+          pool.push({ key: c.key, to: a.matched[0]?.name ?? null, score: a.score });
+        }
+      }
+      // 留在候选本身身上，不挂在数组上。
+      //
+      // 挂数组是错的：`rank()` 会 `candidates.map(...)` 出一个新数组，
+      // 属性在拷贝时丢掉，于是下游永远看不到。实测 2026-11-07：
+      // 加成算出来了，`interested` 却读成 none。
+      //
+      // 每个候选自己带 `interestedIn`，`rank` 的展开会把它带过去。
+      if (pool.length) diagnoseInterest(pool);
+    } catch { /* 兴趣数据坏了不该拦住这一轮 */ }
+  }
+
+  // --- 4b. 一句旧话，后来再没提起 -----------------------------------------
+  //
+  // 这是 `state/revisit.json` 的读者。那份数据原本是 11-05 的一次性诊断
+  // （`sleeping.json`），结论是「112 句自己的话，100 句后来再没被提起过」。
+  // 诊断完就没人看它了 —— 又一份写完不读的表。
+  //
+  // 现在它进候选池。只挑**刚好隔了几天**的：太新她自己还没走远，
+  // 太旧翻出来是骚扰。一天最多一条，`resurface` 自己会返回 null。
+  //
+  // salience 0.42：能赢过志向（0.29 附近）和自画像，赢不过真实对话和
+  // 还有热度的话题。它的位置是「安静的时候会想起来」，不是「打断任何人」。
+  try {
+    const back = workspaceDir ? revisit.resurface(workspaceDir, { now }) : null;
+    if (back) {
+      add({
+        key: back.key,
+        kind: "revisit",
+        salience: back.salience,
+        label: back.label,
+        text: back.line,
+      });
+    }
+  } catch { /* 没有数据就没有这条 */ }
 
   // --- 5. the self card -----------------------------------------------------
   if (s.self?.line) {
@@ -305,6 +418,56 @@ export function notice(snapshot, opts = {}) {
   // --- 7. M4 proposals, as ordinary candidates -----------------------------
   // "Bias, never preempt": a proposal that cannot lose would be an injection.
   for (const c of extra) add(c);
+
+  // --- 8. 好奇心：她碰到但没弄明白的东西 --------------------------------
+  //
+  // 进竞争之前，这些只能在自己的注入块里出现，位置是固定的；于是「碰到一个
+  // 没弄明白的名字」永远和「手上那件事」比不了轻重 —— 一个靠排版，一个靠评分。
+  //
+  // 分数来源：`pull()` 已经是它自己的量，直接当 salience。门槛仍由
+  // `curiosity.propose` 把关（新鲜期 + 0.55）；这里只把已经过线的那些放进
+  // 竞场，不重新发明一遍阈值。
+  //
+  // 一次最多进 2 条：池子里可能同时有好几个过线的，全都堆进候选会把别的
+  // 来源扑死，而「好几个都值得问」不等于「这一轮要说好几件」。
+  const curiousReady = (s.curious ?? [])
+    .map((n) => ({ n, p: Number(n.pullScore) || 0 }))
+    .filter((x) => x.p >= 0.55)
+    .sort((a, b) => b.p - a.p)
+    .slice(0, 2);
+  for (const { n, p } of curiousReady) {
+    add({
+      key: `curious:${n.id}`,
+      kind: "curious",
+      // pull 最高接近 1，但一个没弄明白的名字不该和「有人刚问你话」(0.95)平起
+      // 平坐。压到 0.62 顶部：它能赢过志向和自画像，赢不过真实对话。
+      salience: Math.min(0.62, 0.30 + 0.35 * p),
+      label: "没弄明白的",
+      text: `有件事你还没弄明白：${String(n.display ?? n.topic ?? "").slice(0, 40)}`,
+    });
+  }
+
+  // --- 9. 经验池：写下来了但还没定性的 -----------------------------------
+  //
+  // `pending` 是「发生过、还没想清楚算不算数」。它不是待办，但它确实占着
+  // 一件事没结，所以该和别的东西比一次，而不是固定排在提示词某一行。
+  //
+  // 只取最老的一条：最新的那条往往就是这一轮刚记下的，每轮都提没意义。
+  const oldestPending = (s.pending ?? [])
+    .slice()
+    .sort((a, b) => Date.parse(a.at ?? "") - Date.parse(b.at ?? ""))[0];
+  if (oldestPending) {
+    const ageDays = daysSince(oldestPending.at) ?? 0;
+    add({
+      key: `pending:${oldestPending.id}`,
+      kind: "pending",
+      // 0.34 起，越放越重（最多 +0.12）：一件没结的事拖久了才值得提。
+      // 顶部 0.46 —— 低于好奇心顶部，因为「没弄明白」比「没归类」更驱动人。
+      salience: 0.34 + 0.06 * Math.min(ageDays, 2),
+      label: "还没定性的",
+      text: `有件事你记下了，还没想过它算不算数：${String(oldestPending.what ?? "").slice(0, 40)}`,
+    });
+  }
 
   return out;
 }
@@ -434,7 +597,9 @@ export function compete(workspaceDir, candidates, affect = null) {
   }
 
   attention.noteWin(workspaceDir, winner);
-  return { winner, runnerUp: ranked[1] ?? null, ranked };
+  // 连击要读写完 recent 之后的状态，不然数的还是上一轮。
+  const streak = attention.streakOf(attention.load(workspaceDir));
+  return { winner, runnerUp: ranked[1] ?? null, ranked, streak };
 }
 
 // -------------------------------------------------------------------- RECORD
@@ -483,6 +648,30 @@ export function record(workspaceDir, { awarded = [], at = nowIso() } = {}) {
   return added;
 }
 
+/**
+ * 兴趣加成的旁路记录。
+ *
+ * 不挂在候选数组上 —— `rank()` 会造新数组，属性会丢。这里只留一份
+ * 进程内的最近一次，供 probe 读。它不参与任何判断。
+ */
+let lastInterestHits = [];
+function diagnoseInterest(pool) {
+  lastInterestHits = pool;
+}
+export function interestHits() {
+  return lastInterestHits;
+}
+
+/**
+ * 把调过的行为数值转发给 workspace。
+ *
+ * `index.js` 不直接 import workspace（它通过这里拿 `compete`），
+ * 所以调参也要从这里过一道，免得为了一个赋值去加一条新的依赖边。
+ */
+export function applyTuning(values = {}) {
+  return attention.applyTuning(values);
+}
+
 // --------------------------------------------------------------------- CYCLE
 
 /**
@@ -494,7 +683,7 @@ export function record(workspaceDir, { awarded = [], at = nowIso() } = {}) {
  */
 export function cycle(workspaceDir, opts = {}) {
   const snapshot = observe(workspaceDir);
-  const candidates = notice(snapshot, opts);
+  const candidates = notice(snapshot, { ...opts, workspaceDir });
 
   const result = compete(workspaceDir, candidates, opts.affect ?? null);
   const line = attention.render(result);
@@ -507,12 +696,49 @@ export function cycle(workspaceDir, opts = {}) {
     try { record(workspaceDir, { awarded: events }); } catch { /* never fail a turn */ }
   }
 
+  // 广播：这一轮注意力的结论，给别的模块读。
+  //
+  // 之前竞争只产出一行注入文本，别的系统（内感知、情绪、主动）想知道
+  // 「她这轮在想什么」只能自己去重算一遍，或者干脆不知道。于是所谓
+  // 「全局工作空间」只是一个人均看不见的局部变量。
+  //
+  // `broadcast` 是那一份公开的结论：谁赢了、赢多少、有没有犹豫、连着
+  // 几轮了。写进状态文件，任何模块都能读同一个事实，不必各自猜。
+  //
+  // 只写结论，不写候选全表 —— 全表会让读的人重新排一遍，那就又分裂了。
+  const broadcast = {
+    at: nowIso(),
+    winner: result.winner
+      ? {
+          key: result.winner.key,
+          kind: result.winner.kind,
+          label: result.winner.label ?? "",
+          score: Number(result.winner.score ?? 0),
+          why: result.winner.why ?? null,
+        }
+      : null,
+    contested: Boolean(result.runnerUp?.contested),
+    gap: result.runnerUp
+      ? Math.round(((result.winner?.score ?? 0) - (result.runnerUp?.score ?? 0)) * 1000) / 1000
+      : null,
+    streak: result.streak ?? null,
+    reason: result.reason ?? null,
+    counts: {
+      candidates: candidates.length,
+      aboveFloor: (result.ranked ?? []).filter((c) => Number(c?.score ?? 0) >= attention.MIN_INJECT_SCORE).length,
+    },
+  };
+  try {
+    writeJsonAtomic(statePath(workspaceDir, "attention-broadcast.json"), broadcast);
+  } catch { /* 广播失败不该让这一轮停 */ }
+
   return {
     line,
     winner: result.winner ?? null,
     runnerUp: result.runnerUp ?? null,
     ranked: result.ranked ?? [],
     reason: result.reason ?? null,
+    broadcast,
     observed: {
       goals: (snapshot.goals?.goals ?? []).length,
       topics: snapshot.topics.length,

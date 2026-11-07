@@ -76,9 +76,30 @@ function parseMeta(raw) {
   return meta;
 }
 
-export function buildIndex(workspaceDir) {
+/**
+ * 哪些文件进索引。
+ *
+ * 原来只扫 `<workspace>/memory/**`。`MEMORY.md` 在**工作区根目录**，
+ * 所以它从来没被索引过 —— 而它恰恰是最该被搜到的那一份（长期记忆）。
+ *
+ * 实测 2026-11-07：索引里 23 个文件、3681 条片段，`MEMORY.md` 一条都没有。
+ * 也就是说，每次她说「我记得…」之前搜的东西里，不包含自己写的最长期那份。
+ *
+ * 现在两处都扫：`memory/**` 加根目录的 `MEMORY.md`。按路径去重，
+ * 因为 `memory/MEMORY.md` 如果将来出现了不该被算两遍。
+ */
+function indexTargets(workspaceDir) {
   const memoryDir = path.join(workspaceDir, "memory");
   const files = walk(memoryDir, []);
+  const rootMemory = path.join(workspaceDir, "MEMORY.md");
+  try {
+    if (fs.statSync(rootMemory).isFile()) files.push(rootMemory);
+  } catch { /* 没有就是没有 */ }
+  return [...new Set(files)];
+}
+
+export function buildIndex(workspaceDir) {
+  const files = indexTargets(workspaceDir);
   const docs = [];
   const df = new Map();
 
@@ -156,8 +177,7 @@ export function saveIndex(file, idx) {
 function isStale(workspaceDir, idx) {
   if (!idx.built_at) return true;
   const built = Date.parse(idx.built_at);
-  const memoryDir = path.join(workspaceDir, "memory");
-  for (const f of walk(memoryDir, [])) {
+  for (const f of indexTargets(workspaceDir)) {
     try {
       if (fs.statSync(f).mtimeMs > built) return true;
     } catch {}

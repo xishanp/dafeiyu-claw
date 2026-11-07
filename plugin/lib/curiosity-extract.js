@@ -54,6 +54,48 @@ const COMMON = new Set([
   "data", "type", "name", "size", "utf", "ascii", "hash", "index", "total",
   "undefined", "async", "await", "const", "function", "return", "import",
   "export", "default", "void", "false",
+  // Interface labels, not things in the world.
+  //
+  // Measured 2026-11-06: `Fetch` reached seen=9 and sat at pull=0.70, making it
+  // the top candidate on every wake — the system kept telling her to go and
+  // find out what "Fetch" means. The words came from tool envelopes (`## Web
+  // Fetch`, `Search results`), where they are headings, not nouns. Sentence-
+  // initial position made them pass the capital-letter shape test.
+  //
+  // These are titles of sections, buttons and verbs. None of them is ever a
+  // proper name, in either language.
+  "fetch", "search", "page", "click", "query", "results", "result",
+  // `web` and `http`-family labels are the envelope of every fetched page.
+  // Kept separate from the verb list above because they are not verbs: they are
+  // the transport the text arrived on, which is never the thing worth learning.
+  "web", "http", "https", "url", "uri", "api", "app", "site", "website",
+  "open", "close", "load", "loaded", "save", "saved", "send", "read",
+  "write", "edit", "delete", "copy", "paste", "run", "start", "stop",
+  "add", "remove", "update", "create", "list", "view", "show", "hide",
+  "next", "back", "home", "menu", "login", "logout", "signin", "signup",
+  "submit", "cancel", "confirm", "continue", "retry", "refresh", "reload",
+  "download", "upload", "share", "follow", "like", "comment", "post",
+  "reply", "message", "notification", "settings", "profile", "account",
+  "help", "about", "contact", "privacy", "terms", "policy", "more",
+  "loading", "ready", "done", "success", "failed", "failure", "skip",
+  "previous", "current", "total", "count", "index", "page", "pages",
+  "header", "footer", "sidebar", "content", "main", "section", "article",
+  "step", "note", "warning", "error", "info", "debug", "trace", "log",
+  "summary", "details", "expand", "collapse", "toggle", "filter", "sort",
+  "browser", "chrome", "firefox", "safari", "screenshot", "snapshot",
+  // HTTP / fetch envelopes. Measured 2026-11-06 on her real store: `Source`,
+  // `External`, `AUTH`, `Fwd` and `Domai` all reached the pool because a
+  // capital letter was the only admission test. None of them is a thing in the
+  // world — they are the transport headers around a fetched page.
+  "source", "external", "auth", "fwd", "domain", "domai", "host",
+  "header", "headers", "cookie", "cookies", "agent", "referer", "origin",
+  "endpoint", "payload", "response", "request", "method", "protocol",
+  "cache", "redirect", "timeout", "retry", "fallback", "proxy",
+  // Calendar / pagination labels from scraped listings.
+  "day", "days", "week", "month", "year", "today", "yesterday",
+  "january", "february", "march", "april", "june", "july", "august",
+  "september", "october", "november", "december",
+  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
 ]);
 
 // Extensions that mean "this token is a filename", not "this token is a name".
@@ -149,7 +191,7 @@ export function latin(text) {
     if (/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(clean)) continue;
     // Domains and URLs. `com` is not in FILE_EXT, so the filename rule let
     // `www.gotohui.com` straight through.
-    if (/^(?:www[.])?[a-z0-9-]+([.][a-z0-9-]+)*[.](?:com|org|net|cn|io|dev|edu|gov|co|info|xyz)([/:?#].*)?$/i.test(clean)) continue;
+    if (/^(?:www[.])?[a-z0-9-]+([.][a-z0-9-]+)*[.](?:com|org|net|cn|io|dev|edu|gov|co|info|xyz|uk|jp|de|fr|ru|au|ca|ac|eu|me|tv|cc)([/:?#].*)?$/i.test(clean)) continue;
     // Long lowercase pinyin runs are URL slugs, not names:
     // `xinxiangshi_pingyuanshifanqu` is a path segment from a government site,
     // five words glued together with underscores. A real name does not look like
@@ -159,6 +201,91 @@ export function latin(text) {
     if (/^(?:raw-html|html|json|text|markdown|content|body|head|title)$/i.test(clean)) continue;
     // Hash-like tokens: no vowel structure worth pronouncing, all hex.
     if (/^[a-f0-9]{8,}$/i.test(clean) && !/[g-z]/i.test(clean)) continue;
+
+    // A URL search query is not a name. `water+absorption`,
+    // `aged+rice+water+absorption`, `Koch+2004+Nature+maximum+tree` — every one
+    // of these reached her store on 2026-11-06. The `+` is a URL-encoded space,
+    // so what got stored was the query she had just typed, handed back to her as
+    // the thing she does not understand. Two or more `+` is the tell: a real
+    // name never glues three words with plus signs.
+    if ((clean.match(/\+/g) ?? []).length >= 2) continue;
+    // A bare `A+B` pair is the same shape at smaller size (`AD+IH`, `B9+103`).
+    // Legitimate names never use `+` as an internal separator.
+    if (/^[A-Za-z0-9.]+\+[A-Za-z0-9.+]+$/.test(clean)) continue;
+    // Social handles: a pronounces-nothing tail of digits glued to letters.
+    // `ljwxxs695`, `Benfish03`, `fanlai1030133`, `laosanjia1111317` — these came
+    // from Douyin comment metadata and are account ids, not concepts. She can
+    // never look up what "ljwxxs695" means, so storing it only wastes a wake.
+    // Bound is 4 trailing digits so `gpt-4`, `h264`, `b9` and `Li526` survive.
+    if (/^[A-Za-z][A-Za-z0-9]*[0-9]{4,}$/.test(clean) && !/^[A-Z][a-z]+[0-9]{4}$/.test(clean)) {
+      const letters = (clean.match(/[A-Za-z]/g) ?? []).length;
+      if (letters / clean.length >= 0.5) continue;
+    }
+    // Social handles. Measured 2026-11-06: eleven Douyin account ids reached
+    // her store — `ljwxxs695`, `Benfish03`, `fanlai1030133.5`,
+    // `laosanjia1111317.4`, `Jingyu_81815.3`, `meishaonvchepin5.6`. These are
+    // the handles of people whose videos she watched, not concepts. She can
+    // never look up what "ljwxxs695" means, so each one is a wasted wake.
+    //
+    // The shape is a word run glued to a digit run with no separator, or a
+    // trailing `.digits` weight suffix that the platform appends. Legitimate
+    // version-like names (`gpt-4.1`, `node.js`, `h264`, `B9`) are all rejected
+    // by neither test: they keep a one- or two-digit tail, and `node.js` ends in
+    // a known extension that the filename rule already handles.
+    if (/\.[0-9]+$/.test(clean)) {
+      // `gpt-4.1` is a version, not a handle. A hyphen before the digit run is
+      // the tell: platforms never put a hyphen between a name and its weight.
+      if (!/^[A-Za-z][A-Za-z0-9]{1,}-[0-9]/.test(clean)) continue;
+    }
+    if (/[A-Za-z]{4,}[0-9]{3,}$/.test(clean)) continue;
+    // `Benfish03` — a capitalised word plus a two-digit suffix. `h264` and `b9`
+    // are lowercase-led or all-digits, so they survive this one.
+    if (/^[A-Z][a-z]{3,}[0-9]{2,}$/.test(clean)) continue;
+    // Scrabble-free consonant runs longer than any real word: `ljwxxs`, `dypl`.
+    // Vowel ratio alone misses these because the digit tail pads the length.
+    if (/^[bcdfghjklmnpqrstvwxz]{4,}/i.test(clean) && !/[aeiou]/i.test(clean.slice(0, 8)) && !/-/.test(clean)) continue;
+    // Douyin-style handle: letters and digits interleaved with no separator, and
+    // an opening consonant run that no word contains. `dypl8iw7rto40` — 8
+    // letters, 4 digits, opening on `dypl` which is unpronounceable in any
+    // language. A hyphen anywhere means it is a product version (`gpt-4.1`),
+    // so that escape is required.
+    if (!/-/.test(clean) && /[0-9]/.test(clean) && /^[bcdfghjklmnpqrstvwxz]{3,}/i.test(clean)) continue;
+    if (!/-/.test(clean) && /[0-9]/.test(clean) && /^[bcdfghjklmnpqrstvwxyz]{3,}/i.test(clean)) continue;
+
+    // `Day29`-style calendar labels: an English word glued to a small number.
+    if (/^(?:day|week|month|year|page|step|part|vol|no|item)[0-9]{1,3}$/i.test(clean)) continue;
+
+    // Any dotted multi-label token where the last label is short and has no
+    // vowel is a host or a namespace (`.ebi.ac.uk` already fails the TLD list
+    // below; this catches anything TLD-shaped that the list has not learned
+    // yet). Guarded so `node.js` survives: `js` is an extension and is on the
+    // FILE_EXT list, which is handled further down.
+    if (/^(?:[a-z0-9-]+\.){2,}[a-z]{2,}$/i.test(clean)) {
+      const tld = clean.split(".").pop().toLowerCase();
+      if (!FILE_EXT.has(tld)) continue;
+    }
+
+    // API chains in either case: `page.goto`, `browserType.connectOverCDP`,
+    // `ImageDraw.text`. The original rule required a capital stem, so the
+    // lowercase ones came straight through on 2026-11-06.
+    if (!/\.[a-z0-9]{1,5}$/i.test(clean) && /^\w+\.[a-z][A-Za-z0-9]*$/.test(clean)) continue;
+    if (/^(?:page|browser|window|document|element|console|driver|client|context)\.[a-z]/.test(clean)) continue;
+
+    // Mixed-case random strings: `ZxWkhrGqVqihBVl6ZY8QtPHg1T9i`, `x9G9QDmMXq`.
+    //
+    // Both reached her store on 2026-11-06 from fetched page text. The pure-hex
+    // test above misses them because they carry letters past `f`. Their shape is
+    // the tell: real names alternate consonant and vowel runs a human can
+    // pronounce, while an id switches case mid-word and sprinkles digits without
+    // a separator. Requiring *both* a digit and an interior case flip keeps
+    // `NodeJS`, `JavaScript`, `PowerShell` and `iOS` out of the reject list.
+    const body = clean.replace(/[^A-Za-z0-9]/g, "");
+    const hasDigit = /[0-9]/.test(body);
+    const midCaseFlip = /[a-z][A-Z]/.test(body) || /[A-Z][A-Z][a-z]/.test(body);
+    const vowelish = (body.match(/[aeiouAEIOU]/g) ?? []).length;
+    if (body.length >= 8 && hasDigit && midCaseFlip) continue;
+    // A long token with almost no vowels is not pronounceable, so not a name.
+    if (body.length >= 10 && vowelish / body.length < 0.15) continue;
     // Generated ids: a lowercase slug glued to a long digit run (`show-819136`).
     // Bound is 4 digits so `gpt-4` and `h264` survive — those are the sort of
     // thing this module exists to notice.

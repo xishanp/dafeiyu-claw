@@ -173,10 +173,22 @@ test("propose: repeated encounters surface it", () => {
   assert.equal(picks[0].display, "Zink");
 });
 
-test("propose: never surfaces more than one per wake", () => {
+test("propose: 池子可以有多条，但默认只给一条", () => {
+  // This test used to assert `propose(budget:10).length === 1` — that intake had
+  // a hard ceiling of one. That was MAX_SURFACED leaking from presentation into
+  // intake, and it is what starved the candidate pool: six questions tied at the
+  // same score, exactly one of them ever surfaced, so the same one won every
+  // wake for seven hours while the other five were never offered.
+  //
+  // The rule that survives is about presentation, and it still holds: call with
+  // no budget and you get one. Asking for more gets more, because the caller
+  // ranking a pool needs more than one to rank.
   const ws = freshWs();
   for (const n of ["Zink", "Mesa", "Vulkan", "Turnip"]) for (let i = 0; i < 3; i++) curiosity.notice(ws, n, {});
-  assert.equal(curiosity.propose(ws, { budget: 10 }).length, 1);
+  assert.equal(curiosity.propose(ws).length, 1, "默认仍然只给一条");
+  const many = curiosity.propose(ws, { budget: 10 });
+  assert.equal(many.length, 4, "要多少给多少（受候选数限制）");
+  assert.equal(new Set(many.map((n) => n.id)).size, 4, "四条不同");
 });
 
 test("handOff: turns a noticing into a want", () => {

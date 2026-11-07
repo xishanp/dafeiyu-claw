@@ -254,19 +254,22 @@ test("活动分类：认得出在干什么", async () => {
   assert.equal(a.classify("今天天气不错"), null, "没有活动的句子不算");
 });
 
-test("活动扫描：刷到算她自己干的", async () => {
-  // This test asserted the opposite until 2026-11-06: 「刷到是被动」.
+test("活动扫描：刷到算说过，但不等于真刷过", async () => {
+  // History of this assertion, because it has now been wrong in both directions.
   //
-  // It was wrong for Chinese. 「刷到一条讲哈雷彗星的」 is first person — she
-  // opened it and looked. The passive reading came from the English phrase
-  // "came across", which is what the original rule was written to catch. With
-  // 刷到 excluded, real data showed `scroll` at 46 exposure / 4 done while she
-  // scrolled constantly, and the scoring loop kept proposing "go try scrolling"
-  // because the counters said she barely did it.
+  // 2026-11-06 (first pass): 「刷到是被动」 — wrong for Chinese, since
+  // 「刷到一条讲哈雷彗星的」 is first person. Fixed to count as done.
   //
-  // What the rule is actually for survives: the owner's own lines are not her
-  // activity. He wrote 「你多刷刷抖音」 into the same file, and that is the case
-  // worth excluding.
+  // 2026-11-06 (second pass, same day): counting it as done made `scroll` read
+  // 46 done while `state/douyin.json` held 30 videos and stopped growing after
+  // 11-04. She was writing 「刷到…」 without opening the app. The first fix
+  // treated the wording as evidence of the act; the wording is only evidence of
+  // the sentence.
+  //
+  // Final rule: the diary counts exposure for scroll (she talked about it) and
+  // never done. Done comes from `creditScroll`, which reads real `watchedAt`
+  // rows. The owner's own line is still excluded from both — he wrote
+  // 「你多刷刷抖音」 into the same file.
   const a = await import("../lib/activities.js");
   const ws = tmp();
   fs.mkdirSync(path.join(ws, "memory"), { recursive: true });
@@ -275,9 +278,9 @@ test("活动扫描：刷到算她自己干的", async () => {
     "本鱼: 刷到一条讲彗星的\n本鱼: 刷到个视频\n本鱼: 画了一条鱼\n对方: 你多刷刷抖音\n",
   );
   const d = a.scan(ws);
-  assert.equal(d.kinds.scroll.done, 2, "刷到是她自己看到的，要算她做的");
-  assert.equal(d.kinds.scroll.exposure, 2, "对方那句话不能被算进来");
-  assert.equal(d.kinds.draw.done, 1);
+  assert.equal(d.kinds.scroll.exposure, 2, "说过两次，对方那句不算");
+  assert.equal(d.kinds.scroll.done, 0, "没有观看记录，就不算真刷过");
+  assert.equal(d.kinds.draw.done, 1, "其他类照旧按日记算");
 });
 
 test("活动扫描：真的被推着看才算 passive", async () => {
@@ -665,12 +668,31 @@ test("顺序：手里有事 → 先做手里的；手里空了 → 去探索（�
   const ctx = { hour: 13, familiarity: 0.8, phase: "productive", spokeToday: 0, minutesSinceTalk: 999 };
   const going = { id: "horizon:making", kind: "horizon", title: "去碰一下「东西是怎么做出来的」" };
 
-  // 手里空了：候选池空，决策落到探索
+  // 手里空了：由 decide 兜底去探索
+  //
+  // This asserted `r.do.length === 0` — that with no wants the pool is empty and
+  // the only candidate comes from `whenEmpty`. That rule predates the douyin
+  // source added 2026-11-06 on the owner's instruction (「全换成抖音候选」),
+  // and the two cannot both hold: a standing "go meet another fish" offer is a
+  // real candidate, not a fallback, so the pool is legitimately non-empty on an
+  // empty-handed hour.
+  //
+  // What survives is the ordering the test was actually protecting: exploration
+  // must not be crowded out by make-work, and a live want must still beat
+  // everything else. So the assertion moves from "the pool has nothing" to "the
+  // pool has nothing that outranks going out for something she decided".
   let r = intent.rankNow(ws, { threshold: 0.25 });
-  assert.equal(r.do.length, 0, "没有 want 时不该有候选硬撑着");
+  assert.equal(
+    r.do.filter((c) => c.kind === "want").length,
+    0,
+    "没有 want 时不该有 want 硬撑着",
+  );
   let a = decide.decide(r.do, ctx, { whenEmpty: going });
-  assert.equal(a.kind, "do", "手里空了应该去探索，不是休息");
-  assert.equal(a.candidate.id, "horizon:making");
+  assert.equal(a.kind, "do", "手里空了应该去探索或出门，不是休息");
+  // Whichever wins, it must not be a fallback rest and it must not be
+  // something she never chose. Either an exploration card or a douyin card is
+  // acceptable; `rest` is not.
+  assert.notEqual(a.kind, "rest", "空手不等于该歇着");
 
   // 手里有事：want 赢，探索让位
   wants.add(ws, { what: "想去看看那条河", value: 0.8 });

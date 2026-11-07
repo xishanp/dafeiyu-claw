@@ -18,9 +18,9 @@
 
 <p align="center">
   <img alt="Prompts" src="https://img.shields.io/badge/Prompts-7%20files-DC2626">
-  <img alt="Reference" src="https://img.shields.io/badge/Reference%20impl-61%20tools-2563EB">
-  <img alt="Modules" src="https://img.shields.io/badge/Modules-39-7C3AED">
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-232%20passing-16A34A">
+  <img alt="Reference" src="https://img.shields.io/badge/Reference%20impl-78%20tools-2563EB">
+  <img alt="Modules" src="https://img.shields.io/badge/Modules-55-7C3AED">
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-554%20passing-16A34A">
   <img alt="Deps" src="https://img.shields.io/badge/Dependencies-0-6B7280">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-16A34A">
 </p>
@@ -80,6 +80,19 @@ cp prompt-PROACTIVE.md <你的工作区>/PROACTIVE.md
 > [!NOTE]
 > 每份文件里都有 `<...>` 占位符。全部替换成你自己的部署再使用。
 > 直接拿去跑不会崩，但会说错自己是什么。
+
+> [!IMPORTANT]
+> **关于「本鱼」这个名字。** 代码里有 35 处 `本鱼`，都在 `plugin/lib/` 下，
+> 是日记和记忆文件的**格式标识符**，不是称呼：
+>
+> ```
+> ## 本鱼写过的      ← compulsion.js / discipline.js 靠这一行定位正文
+> 本鱼: 今天看到…    ← 对话块里的说话人标记
+> ```
+>
+> 改掉它会让解析失效（那两个文件会读不到自己写的日记）。
+> 如果要把角色名改掉，得连这里一起改，是一处**格式变更**，不是替换文本。
+> 其余地方出现的角色名已经全部换成 `<角色名>` 占位符。
 
 ---
 
@@ -296,10 +309,10 @@ cp -r plugin ~/.openclaw/extensions/dafeiyu-core
 ### 3.1 规模
 
 ```
-plugin/index.js         8,300 行
-plugin/lib/             39 个模块，10,700 行
-plugin/test/            232 项测试，全部通过
-注册工具                 61 个（5 处工厂函数条件注册）
+plugin/index.js         10,723 行
+plugin/lib/             55 个模块，16,556 行
+plugin/test/            56 个文件，554 项测试，全部通过
+注册工具                 78 个（5 处工厂函数条件注册）
 钩子                     11 个
 外部依赖                 0 个
 ```
@@ -352,10 +365,10 @@ agent_end               收尾、写日志
 │   └── LESSONS.md           踩过的坑
 ├── plugin/                  参考实现（可选）
 │   ├── index.js
-│   ├── lib/                 39 个模块
+│   ├── lib/                 55 个模块
 │   ├── shared/              出站串行锁（在 plugin 内部）
 │   ├── scripts/             自检与一致性检查
-│   └── test/                128 项测试
+│   └── test/                554 项测试
 └── workspace/               示例：工具与玩具
     ├── memory/              记忆示例（模板，非真实内容）
     ├── tools/               工具脚本

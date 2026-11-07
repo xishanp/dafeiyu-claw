@@ -42,12 +42,20 @@ test("compulsion: 换了别的事，连击归零", () => {
   assert.equal(compulsion.check(ws).stuck, false, "换了事就不算打转");
 });
 
-test("compulsion: 3 轮还没到报警线", () => {
+test("compulsion: 连着 2 轮就报警", () => {
+  // 用户 2026-11-06 把线从 4 降到 2：等四轮意味着已经重复四次才反应。
   const ws = tmp();
-  for (let i = 0; i < 3; i++) compulsion.recordPick(ws, `want:want-${i}`);
+  for (let i = 0; i < 2; i++) compulsion.recordPick(ws, `want:want-${i}`);
   const c = compulsion.check(ws);
-  assert.equal(c.streak.length, 3);
-  assert.equal(c.stuck, false, "3 轮是正常深挖，不是打转");
+  assert.equal(c.streak.length, 2);
+  assert.equal(c.stuck, true, "连着 2 轮同类就该熔断");
+});
+
+test("compulsion: 只做 1 轮不算打转", () => {
+  const ws = tmp();
+  compulsion.recordPick(ws, "want:want-0");
+  const c = compulsion.check(ws);
+  assert.equal(c.stuck, false);
 });
 
 test("compulsion: streakKey 把不同 id 归成同一类行为", () => {
@@ -192,9 +200,12 @@ test("intent: 打转的时候，别的事能排在原来的念头前面", () => 
   );
 });
 
-test("intent: 打转时那个念头被标记 stalled", () => {
+test("intent: 同类连着 2 轮后，这一类被熔断切断", () => {
+  // 用户 2026-11-06：「重复两三次自动熔断」。降到 0.25 倍没用 ——
+  // 0.9 x 0.25 = 0.225 仍然高于门槛，池子一薄它又赢回来。
+  // 所以现在是真的把它从这一轮拿掉。
   const ws = tmp();
-  for (let i = 0; i < 5; i++) compulsion.recordPick(ws, `want:want-${i}`);
+  for (let i = 0; i < 2; i++) compulsion.recordPick(ws, `want:want-${i}`);
   fs.writeFileSync(
     path.join(ws, "state", "wants.json"),
     JSON.stringify({
@@ -202,9 +213,24 @@ test("intent: 打转时那个念头被标记 stalled", () => {
       wants: [{ id: "want-y", what: "继续查", status: "open", value: 0.9, at: new Date().toISOString() }],
     }),
   );
-  const c = intent.collect(ws).find((x) => x.id === "want:want-y");
-  assert.ok(c, "那条念头应该在候选里（不是被删掉）");
-  assert.equal(c.stalled, true, "打转时应被标记 stalled，降权而不是删除");
+  const all = intent.collect(ws);
+  assert.equal(all.some((x) => x.id === "want:want-y"), true, "collect 阶段还应该看得到它");
+  const r = intent.rankNow(ws, { threshold: 0.3 });
+  assert.equal(r.ranked.some((x) => x.id === "want:want-y"), false, "熔断后不该再被选中");
+});
+
+test("intent: 没到线时 want 正常出现", () => {
+  const ws = tmp();
+  compulsion.recordPick(ws, "want:want-0");
+  fs.writeFileSync(
+    path.join(ws, "state", "wants.json"),
+    JSON.stringify({
+      version: 1,
+      wants: [{ id: "want-y", what: "继续查", status: "open", value: 0.9, at: new Date().toISOString() }],
+    }),
+  );
+  const r = intent.rankNow(ws, { threshold: 0.3 });
+  assert.equal(r.ranked.some((x) => x.id === "want:want-y"), true, "只做 1 轮不该被切断");
 });
 
 // ---------------------------------------------------------------------------
@@ -267,14 +293,25 @@ test("decide: dormant 相位下，弱的普通任务仍然变 rest", async () =>
 // 打断不等于解决。计数器一归零，检测器唯一的响应反而保证了它能重演。
 // ---------------------------------------------------------------------------
 
-test("compulsion: 中途插了别的候选，连击不归零", () => {
+test("compulsion: 连击只数末尾那一段", () => {
   const mk = (keys) => keys.map((k, i) => ({ id: k, key: k, at: new Date(2026, 10, 6, 4, i).toISOString() }));
-  // 这正是真实发生过的序列
-  assert.equal(compulsion.currentStreak(mk(["A", "A", "A", "A", "B", "A"])), 5);
-  // 严格连续时是这个数
+  // 窗口计数会把这个算成 5，这是 2026-11-06 发现的 bug：
+  // 它让 A/B 交替读出 6 连击，于是降权在制造交替。
+  assert.equal(compulsion.currentStreak(mk(["A", "A", "A", "A", "B", "A"])), 1);
+  // 严格连续时才是真连击
   assert.equal(compulsion.currentStreak(mk(["A", "A", "A", "A"])), 4);
-  // 来回横跳也要累计，不然交替两个候选就能无限循环
-  assert.equal(compulsion.currentStreak(mk(["A", "B", "A", "B", "A"])), 3);
+  // A/B 交替不是 3 连击，是 1 —— 交替由 rotation() 单独识别
+  assert.equal(compulsion.currentStreak(mk(["A", "B", "A", "B", "A"])), 1);
+});
+
+test("compulsion: 窗口计数会把交替读成连击（记录这个 bug）", () => {
+  // 旧实现的算法，留着是为了让这个错误没法悄悄回来
+  const oldCount = (keys) => {
+    const tail = keys.slice(-12);
+    return tail.filter((k) => k === tail[tail.length - 1]).length;
+  };
+  assert.equal(oldCount(["A", "B", "A", "B", "A", "B", "A", "B", "A", "B", "A", "B"]), 6,
+    "窗口计数确实把 12 轮交替读成 6 连击");
 });
 
 test("compulsion: 长时间没碰过的不算连击", () => {
@@ -338,4 +375,119 @@ test("want: 反复做的那条会被点名，而不是只报「某一类」", as
   // 没反复做的不该被这么说
   const fresh = intent.wantBasis({ value: 0.45, attempts: 1 }, 5);
   assert.ok(!fresh.includes("还没收掉"), `刚开始的不该这么说，实际：${fresh}`);
+});
+
+// --------------------------------------------------------------- 熔断接线
+
+test("熔断：overPicked 读到 counts，不是空数组", () => {
+  // 这条守的是一个真实的接线 bug，不是算法。
+  //
+  // 实测 2026-11-07：`intent.rankNow` 调的是 `compulsion.loadPicks()`，
+  // 那个返回**只含 picks 的数组**；而 `overPicked()` 读的是 `data.counts`。
+  // 数组上没有 counts → 永远 `{}` → 永远返回空集合。
+  //
+  // 后果：「做过两次就熔断」这条规则一次都没执行过。`douyin:meet`
+  // 的 counts 到了 85，每一轮还在被推 —— 她被推了 85 次同一件事，
+  // 早就知道没用，于是每轮都跳过。外面看是「她不肯做」，
+  // 实际是系统一直在重复同一句废话。
+  const ws = tmp();
+  compulsion.recordPick(ws, "douyin:meet");
+  compulsion.recordPick(ws, "douyin:meet");
+
+  const full = compulsion.loadState(ws);
+  const picks = compulsion.loadPicks(ws);
+
+  // 完整状态能读出该熔断的
+  assert.ok(compulsion.overPicked(full, 2).has("douyin:meet"), "完整状态应能熔断");
+
+  // 只传 picks 数组读不出来 —— 这正是当初的 bug，用断言把它钉住，
+  // 免得有人又把 rankNow 改回去。
+  assert.equal(compulsion.overPicked(picks, 2).size, 0, "数组上没有 counts，读不出来");
+});
+
+test("熔断：rankNow 真的把超过阈值的候选剔掉", () => {
+  // 端到端：连续 pick 同一个候选，它应该从 do 里消失、出现在 melted 里。
+  const ws = tmp();
+  for (let i = 0; i < 3; i += 1) compulsion.recordPick(ws, "douyin:meet");
+
+  const r = intent.rankNow(ws, { threshold: 0 });
+  const ids = (r.do || []).map((c) => c.id);
+  assert.ok(!ids.includes("douyin:meet"), `被推过 3 次的应该熔断，实际还在 do 里：${ids.join(",")}`);
+  assert.ok((r.melted || []).includes("douyin:meet"), "应出现在 melted 名单里");
+});
+
+test("熔断：rankNow 的 offered 字段真的读到了 counts", () => {
+  // 上一条测的是结果（do 里没有它），但如果中段有别的过滤先把它剔掉，
+  // 那条测试即使接线错了也会通过 —— 实测过：把 loadState 改回 loadPicks，
+  // rankNow 那条仍然绿。
+  //
+  // 所以这条直接查 rankNow 自己报出来的 `offered`。它来自熔断集，
+  // 不是从最终结果反推的，接错线就一定是空的。
+  const ws = tmp();
+  compulsion.recordPick(ws, "douyin:meet");
+  compulsion.recordPick(ws, "douyin:meet");
+
+  const r = intent.rankNow(ws, { threshold: 0 });
+  assert.ok(
+    (r.offered || []).includes("douyin:meet"),
+    `rankNow 应报出被熔断的 id，实际 offered=${JSON.stringify(r.offered)}`,
+  );
+});
+
+test("overPicked: 窗口外的不算熔断（这是 12:11 全空的原因）", () => {
+  // 实测 2026-11-07 12:11：12 个候选全在 counts 里且 >= 2，rankNow 返回空，
+  // 那一轮心跳一条都没注入。外面看是「她不想做」，实际是她没得选。
+  // counts 是终身累计，不该当刹车用。
+  const now = Date.parse("2026-11-07T12:00:00Z");
+  const data = {
+    picks: [
+      { id: "douyin:watch:2026-11-07", key: "douyin", at: "2026-11-07T03:25:00Z" }, // 8.5h 前
+      { id: "douyin:watch:2026-11-07", key: "douyin", at: "2026-11-07T03:25:10Z" },
+    ],
+    counts: { "douyin:watch:2026-11-07": 99 }, // 终身累计很高，但都在窗口外
+  };
+  const over = compulsion.overPicked(data, 2, { now });
+  assert.equal(over.size, 0, `窗口外不该熔断，实际: ${[...over]}`);
+});
+
+test("overPicked: 窗口内的照旧熔断", () => {
+  const now = Date.parse("2026-11-07T12:00:00Z");
+  const data = {
+    picks: [
+      { id: "gap:shoot", key: "gap", at: "2026-11-07T11:50:00Z" },
+      { id: "gap:shoot", key: "gap", at: "2026-11-07T11:55:00Z" },
+    ],
+    counts: { "gap:shoot": 2 },
+  };
+  const over = compulsion.overPicked(data, 2, { now });
+  assert.ok(over.has("gap:shoot"), "10 分钟内推两次，应该熔断");
+});
+
+test("overPicked: 熔断会过期，不是永久判决", () => {
+  const picks = [
+    { id: "x", key: "x", at: "2026-11-07T08:00:00Z" },
+    { id: "x", key: "x", at: "2026-11-07T08:10:00Z" },
+  ];
+  const at10 = Date.parse("2026-11-07T10:00:00Z"); // 窗口内
+  const at12 = Date.parse("2026-11-07T12:00:00Z"); // 窗口外
+  assert.ok(compulsion.overPicked({ picks }, 2, { now: at10 }).has("x"), "2 小时内仍熔断");
+  assert.ok(!compulsion.overPicked({ picks }, 2, { now: at12 }).has("x"), "4 小时后应解冻");
+});
+
+test("内部会话（internal-session-effects）不该算一次 pick", () => {
+  // 实测 2026-11-07 12:00:
+  //   04:00:13  agent:dafeiyu:main                      → gap:shoot
+  //   04:00:30  agent:dafeiyu:internal-session-effects  → gap:try
+  // 相隔 17 秒。第二个是机器回合，重跑了 before_prompt_build，
+  // 她没看到提案也没做决定，却记成了同一个 key 的第二次，直接把熔断闸打下来。
+  const INTERNAL = /:internal-session-effects:|:cron:|:node-/;
+  const keys = [
+    ["agent:dafeiyu:main", false],
+    ["agent:dafeiyu:internal-session-effects:5d5891d5-x", true],
+    ["agent:dafeiyu:cron:9adc56cb", true],
+    ["agent:dafeiyu:onebot:group:private:10001", false],
+  ];
+  for (const [key, shouldSkip] of keys) {
+    assert.equal(INTERNAL.test(key), shouldSkip, `${key} 应${shouldSkip ? "" : "不"}跳过`);
+  }
 });

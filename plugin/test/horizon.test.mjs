@@ -25,14 +25,14 @@ const writeEntities = (ws, names) => {
 //
 // Measured 2026-11-06 on her real workspace — eleven recorded entities, all of
 // them either about herself or about somebody else's video about her:
-//   人生公式 二选一 遗憾 大肥鱼 声音 破晓手记 抖音 上下文溢出 记忆系统
+//   人生公式 二选一 遗憾 小鲸鱼 声音 破晓手记 抖音 上下文溢出 记忆系统
 //   小版本更新 记忆星图
 // Nine of ten domains came back blank. Nothing in the system could say that.
 // ---------------------------------------------------------------------------
 
 test("horizon: 只记过自己的事，就把大部分方向算成空白", () => {
   const ws = tmp();
-  writeEntities(ws, ["大肥鱼", "记忆系统", "声音", "抖音", "遗憾"]);
+  writeEntities(ws, ["小鲸鱼", "记忆系统", "声音", "抖音", "遗憾"]);
   const b = horizon.blanks(ws);
   assert.ok(
     b.length >= 8,
@@ -61,7 +61,7 @@ test("horizon: map 和 blanks 说的是同一件事", () => {
   // 用后者而 map 用前者。结果是一个报表说「0/10 空白」，旁边的选择器却兴高采
   // 烈地推荐了一个空白方向。一个问题的两个「真相」，数字就失去意义了。
   const ws = tmp();
-  writeEntities(ws, ["大肥鱼", "记忆系统"]);
+  writeEntities(ws, ["小鲸鱼", "记忆系统"]);
   const mp = horizon.map(ws);
   const b = horizon.blanks(ws);
   assert.equal(
@@ -147,7 +147,7 @@ test("intent: 空白方向不是候选项", () => {
   //
   // 「出去看看」不是一件排队的差事，它是清单空了之后的去向。
   const ws = tmp();
-  writeEntities(ws, ["大肥鱼", "记忆系统"]);
+  writeEntities(ws, ["小鲸鱼", "记忆系统"]);
   const c = intent.collect(ws);
   assert.equal(c.find((x) => x.kind === "horizon"), undefined, "空白方向不该在候选池里");
 });
@@ -187,4 +187,70 @@ test("horizon: 连着走，方向真的在换，不会绕回同一个", () => {
     horizon.visit(ws, p.id, {});
   }
   assert.equal(new Set(seen).size, 4, `4 次应是 4 个不同方向，实际 ${seen.join(",")}`);
+});
+
+// ---------------------------------------------------------------------------
+// 十站走完之后去哪。
+//
+// 2026-11-06 真机：她认真走完了全部十个方向，每次都有实质收获
+// （浮法玻璃 6.3mm、车流自组织、云滴凝结停在 15-20μm…）。
+// 然后 `blanks()` 返回 []，`nextBlank()` 返回 null，
+// 调用方把 null 变成 `whenEmpty: null`，`decide()` 回落到 `rest`。
+//
+// 也就是说：这一层存在的唯一目的（别再发呆），
+// 在它成功之后的第一天就失效了。
+// ---------------------------------------------------------------------------
+
+test("horizon: 十站全走完，不等于没地方可去", async () => {
+  const horizon = await import("../lib/horizon.js");
+  const ws = tmp();
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+
+  // 每个方向都记一次「去过了」，不给任何实体
+  for (const id of Object.keys(horizon.DOMAINS)) {
+    horizon.visit(ws, id, { found: "去看了，没抓住什么" });
+  }
+
+  const blanks = horizon.blanks(ws);
+  assert.equal(blanks.length, 0, "前提：确实没有空白了");
+
+  const next = horizon.nextBlank(ws);
+  assert.ok(next, "走完了也必须还有一个方向可以给——返回 null 会让空池退化成发呆");
+  assert.ok(next.id, "给出来的得有 id");
+  assert.ok(next.probe, "还得带一句能动手的提示，否则给了等于没给");
+});
+
+test("horizon: 每次都真去，给的就不是同一个", async () => {
+  const horizon = await import("../lib/horizon.js");
+  const ws = tmp();
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+
+  for (const id of Object.keys(horizon.DOMAINS)) {
+    horizon.visit(ws, id, { found: "路过" });
+  }
+
+  // 轮换计数只在真去过之后推进，所以这里要模拟「给了 -> 去了」。
+  // 不 visit 就重给同一个是对的：没去的话，换一个只是逃避。
+  const picks = [];
+  for (let i = 0; i < 6; i++) {
+    const b = horizon.nextBlank(ws);
+    assert.ok(b, `第 ${i + 1} 次也要有东西可给`);
+    picks.push(b.id);
+    horizon.visit(ws, b.id, { found: `第 ${i + 1} 次去看了` });
+  }
+  const uniq = new Set(picks);
+  assert.ok(uniq.size >= 3, `连着去之后方向要换，实际只给了 ${[...uniq].join(",")}`);
+});
+
+test("horizon: 一个方向都没有时才算真的没地方去", async () => {
+  const horizon = await import("../lib/horizon.js");
+  // 全部方向都被标记为「碰过」并且命中数已经到顶，仍然该给最薄的那个
+  const ws = tmp();
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  const d = horizon.load(ws);
+  d.visits = Object.keys(horizon.DOMAINS).map((domain) => ({ domain, at: Date.now() }));
+  horizon.save(ws, d);
+
+  const b = horizon.nextBlank(ws);
+  assert.ok(b, "还有十个方向可讲，不该返回 null");
 });

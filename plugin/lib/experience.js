@@ -119,6 +119,55 @@ function gistOf(what) {
     .slice(0, 18);
 }
 
+/**
+ * Retire pending entries nobody ever got round to judging.
+ *
+ * Without this the pool has no exit for the common case: she records a thing,
+ * the next turn records another, and `experience_resolve` is a manual call she
+ * makes when she happens to notice the block. Measured 2026-11-07: 15 pending,
+ * the oldest from the previous morning, `last_reflected_at` two days stale.
+ * 21 entries had been resolved overnight and the pool still grew — intake beat
+ * judgement, and the backlog was invisible except as a longer prompt block.
+ *
+ * Ageing is not the same as judging. A retired entry is marked `dropped` with a
+ * note saying nobody judged it, so the record stays honest about what happened:
+ * the thing was written down and then forgotten, which is a real outcome and a
+ * more useful one than a queue that never drains.
+ */
+function ageOut(workspaceDir, { days = 3, keep = 3 } = {}) {
+  const data = load(workspaceDir);
+  const cutoff = Date.now() - days * 86400000;
+  const pendingItems = data.entries.filter((e) => e.status === "pending");
+  if (!pendingItems.length) return 0;
+  // `keep` protects the newest N by POSITION, not a gate on the whole pass.
+  //
+  // The first version returned early when the pool held <= keep items, so four
+  // entries from five days ago were all preserved — the pool was small, so it
+  // was assumed healthy. Size says nothing about age; the only thing that makes
+  // an entry stale is time, and that has to be checked per entry.
+  const newest = new Set(
+    pendingItems.slice(-keep).map((e) => e.id),
+  );
+  const old = pendingItems
+    .filter((e) => !newest.has(e.id))
+    .filter((e) => {
+      const t = Date.parse(e.at ?? "");
+      return Number.isFinite(t) && t < cutoff;
+    })
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  if (!old.length) return 0;
+  let n = 0;
+  for (const e of old) {
+    e.status = "dropped";
+    e.resolved_at = new Date().toISOString();
+    e.resolve_note = "放了几天没回头看，就这么过去了";
+    e.aged_out = true;
+    n += 1;
+  }
+  if (n) save(workspaceDir, data);
+  return n;
+}
+
 function pending(workspaceDir, limit = 12) {
   return load(workspaceDir)
     .entries.filter((e) => e.status === "pending")
@@ -144,7 +193,7 @@ function resolve(workspaceDir, id, outcome, note) {
  * one fact line, nothing read it again, and the thing itself was gone. Measured
  * on 2026-11-06 with the one unambiguous curiosity event in her history:
  *
- *   03:23:37  《给我家大肥鱼养的记忆星图》, feel: touching
+ *   03:23:37  《给我家这个角色养的记忆星图》, feel: touching
  *   03:29:28  status: kept, note 「跟本鱼自己这层记忆是同一件事」
  *   after     nothing, ever
  *
@@ -194,4 +243,4 @@ function describe(workspaceDir, limit = 4) {
   ].join("\n");
 }
 
-export { add, pending, resolve, describe, load, save, gistOf, openQuestions };
+export { add, pending, resolve, describe, load, save, gistOf, openQuestions, ageOut };

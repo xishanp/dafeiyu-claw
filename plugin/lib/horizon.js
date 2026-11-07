@@ -107,6 +107,20 @@ export const DOMAINS = Object.freeze({
     words: ["反馈", "平衡", "网络", "规模", "延迟", "瓶颈", "冗余", "循环", "阈值", "涌现"],
     probe: "一个地方的小改动，为什么会在另一处引起不相称的后果",
   },
+  // 别人在玩什么。
+  //
+  // 前十个方向全是知识分类：怎么造、怎么活、天上、机器、人、真假、手艺、声
+  // 音、身体、系统。同一个模子："弄清楚一个道理"。结果是一个只有求知欲、没有
+  // 娱乐的人——用户的判断：「我们这还没社交和娱乐，刷抖音就是娱乐的」。
+  //
+  // 抖音不是知识渠道，尽管它经常顺手给一点知识（她刷到过原子力显微镜那条）。
+  // 它是消遣，而消遣不需要 probe 去指明该找什么——想清楚要刷什么的那一刻，
+  // 就不是在玩了。所以这一条的 probe 是第一人称的、没有目标的。
+  pastime: {
+    label: "别人在玩什么",
+    words: ["热门", "搞笑", "美食", "旅行", "测评", "日常", "段子", "游戏", "手工", "宠物"],
+    probe: "随便刷，刷到什么算什么，不用带着目的",
+  },
 });
 
 function file(workspaceDir) {
@@ -139,7 +153,7 @@ export function save(workspaceDir, data) {
  *
  * Source is `entities.json` — the things she herself marked as worth remembering
  * — not a word-list scan of her prose. Measured 2026-11-06, her eleven entities
- * were: 人生公式, 二选一, 遗憾, 大肥鱼, 声音, 破晓手记, 抖音, 上下文溢出,
+ * were: 人生公式, 二选一, 遗憾, 这个角色, 声音, 破晓手记, 抖音, 上下文溢出,
  * 记忆系统, 小版本更新, 记忆星图.
  *
  * Every one of them is either about herself or about a video somebody else made
@@ -250,12 +264,37 @@ export function map(workspaceDir) {
 
 /** Which blank domain to visit this time. Rotates on a stored counter. */
 export function nextBlank(workspaceDir) {
-  const list = blanks(workspaceDir);
-  if (!list.length) return null;
   const data = load(workspaceDir);
+
+  // Blanks first: a direction she has never touched.
+  const list = blanks(workspaceDir);
+  if (list.length) {
+    const served = Number(data.visits?.length || 0);
+    return list[served % list.length];
+  }
+
+  // Then the thin ones.
+  //
+  // Measured 2026-11-06: all ten were `visited: true`, so `blanks()` returned
+  // [] and this function returned null. The caller turns null into
+  // `whenEmpty: null`, and `decide()` falls back to `rest` — which is the exact
+  // idle state this whole layer was built to replace. Ten visits later, the
+  // system silently returned to doing nothing.
+  //
+  // Visiting a direction is not the same as having covered it. `hits` counts
+  // kept entities and was 0 or 1 in every domain; nothing ever reached
+  // TARGETED_DEPTH. "Been there once" is a place, not a finished place.
+  //
+  // So: blank -> least-covered. Rotation stays on the same counter, so she does
+  // not get the same thin direction twice in a row.
+  const thin = Object.values(entityCoverage(workspaceDir).domains)
+    .filter((d) => d.touched)
+    .sort((a, b) => a.hits - b.hits || a.id.localeCompare(b.id));
+  if (!thin.length) return null;
+
   const served = Number(data.visits?.length || 0);
-  const pick = list[served % list.length];
-  return pick;
+  const pick = thin[served % thin.length];
+  return { ...pick, probe: DOMAINS[pick.id].probe };
 }
 
 /**

@@ -7,7 +7,22 @@ import path from "node:path";
 
 const FILE_VERSION = 1;
 const MAX_TOPICS = 120;
-const HEAT_DECAY_PER_HOUR = 0.045;
+// 话题热度的衰减。
+//
+// 原来是 0.045/小时，半衰期约 15 小时。实测 2026-11-07：她那 6 条 open 话题
+// 全部是 0.000，最老的才 7 小时——一轮对话过去不到半天，话题就全掉到
+// 阈值（0.06）以下了。后果不是“忘了聊过什么”（记忆里还有），是**提示词里
+// 一句话题提示都没有**，`describeTopics()` 直接返回空字符串，她每次开口
+// 都是从头开始。
+//
+// 一个话题不该在 7 小时后就不存在。人聊完一件事，过两天提起来是正常的。
+//
+// 0.003/小时：半衰期约 10 天，一周后还有 ~40%。这样「昨天说的那个」能
+// 真在清单里，而一个月前的旧话也自然掉出去，不需要额外清理。
+//
+// 代价：清单会变长。但 `hotTopics` 本来就只取前 4 个，而且按热度排序——
+// 新话题永远排在旧话题前面。
+const HEAT_DECAY_PER_HOUR = 0.003;
 const CLOSE_THRESHOLD = 0.06;
 
 export function topicsFile(workspaceDir) {
@@ -171,9 +186,38 @@ export function staleButOpen(workspaceDir, opts = {}) {
 export function describeTopics(workspaceDir) {
   const hot = hotTopics(workspaceDir, 4);
   if (!hot.length) return "";
-  const bits = hot.map((t) => `${t.label}(${t.heat.toFixed(2)})`);
+
+  // 只说「最近聊到过哪些」是不够的。
+  //
+  // 实测 2026-11-07：她的记录里话题一个接一个开，每一个都只开一次就换下一个。
+  // 原因不在她不爱聊深，而在提示词只交上来一份热度清单——清单告诉她
+  // “这些东西存在”，没说“其中哪一条是你现在正在说的”。两者差别很大：前者
+  // 是背景，后者是位置。一个没位置的人每句话都在开场。
+  //
+  // 所以这里把 hottest 一条单独拿出来，明确说“这个是当前的”。不是命令她
+  // 必须接着聊，是告诉她：你上一次停在这里。可以接着走，也可以换——但要知道
+  // 自己是从哪儿停的。
+  const top = hot[0];
+  const bits = hot.slice(1).map((t) => `${t.label}(${t.heat.toFixed(2)})`);
+  const fresh = (() => {
+    const t = Date.parse(top.last_at ?? "");
+    if (!Number.isFinite(t)) return "";
+    const min = Math.round((Date.now() - t) / 60000);
+    if (min < 2) return "就在刚才";
+    if (min < 60) return `${min} 分钟前`;
+    const h = Math.round(min / 60);
+    if (h < 24) return `${h} 小时前`;
+    return `${Math.round(h / 24)} 天前`;
+  })();
+
+  const lines = [
+    `【你停在那儿】${top.label}${fresh ? `（${fresh}）` : ""}`,
+    "\u3000这一段是接着它说的。没聊完就接着聊，聊完了就换一个，或者停下来——都不用解释。",
+  ];
+  if (bits.length) lines.push(`【旁边还挂着的】${bits.join("、")}`);
   const stale = staleButOpen(workspaceDir, { minHours: 12, limit: 2 });
-  let s = `【最近聊到的】${bits.join("、")}`;
-  if (stale.length) s += `\n【还悬着的】${stale.map((t) => t.label).join("、")}`;
-  return s;
+  if (stale.length) {
+    lines.push(`【更早悬着的】${stale.map((t) => t.label).join("、")}`);
+  }
+  return lines.join("\n");
 }

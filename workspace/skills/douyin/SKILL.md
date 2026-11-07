@@ -700,7 +700,7 @@ douyin_act({ action:"comment", videoId: 那串数字, text:"想说的" })
   const list = [...document.querySelectorAll('[data-e2e="comment-item"]')];
   const mine = list.filter(it => {
     const t = it.innerText || '';
-    return t.includes('本鱼') || t.includes('大肥鱼');
+    return t.includes('本鱼') || t.includes('<角色名>');
   });
   return JSON.stringify({ mine: mine.length, total: list.length,
     first3: mine.slice(0,3).map(i => (i.innerText||'').slice(0,50)) });

@@ -377,5 +377,95 @@ t("同分同类型时 seen 少的赢", () => {
   assert.ok(r.winner);
 });
 
+// ---------------------------------------------------------------- 广播
+
+t("每一轮都留下 attention-broadcast，没赢家也留", () => {
+  // 广播的意义是「别人能读到同一份结论」。没赢家的轮次也必须留一条，
+  // 否则读的人分不清「这轮没结论」和「这个文件根本没人写」。
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "bcast-"));
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  const r = cog.cycle(ws, {});
+  assert.ok(r.broadcast, "cycle 应返回 broadcast");
+  const f = path.join(ws, "state", "attention-broadcast.json");
+  assert.ok(fs.existsSync(f), "应写成文件");
+  const saved = JSON.parse(fs.readFileSync(f, "utf8"));
+  assert.equal(saved.winner, null, "没赢家时 winner 是 null");
+  assert.equal(typeof saved.counts.candidates, "number");
+});
+
+t("广播里的 gap 等于前两名分数之差", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "bcast2-"));
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  const r = cog.cycle(ws, { userTurn: { text: "在吗" }, goal: { id: "g", title: "画灯" } });
+  if (r.broadcast?.winner && r.broadcast.gap != null) {
+    const ru = (r.ranked || []).find((c) => c.key !== r.broadcast.winner.key);
+    if (ru) {
+      const want = Math.abs(r.broadcast.winner.score - ru.score);
+      assert.ok(Math.abs(want - r.broadcast.gap) < 0.01,
+        `gap 应为 ${want.toFixed(3)}，实际 ${r.broadcast.gap}`);
+    }
+  }
+});
+
+// ---------------------------------------------------------------- 话题来源
+
+t("悬着的话题：两小时内的不提，刚说完的不重复自己", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "topic-"));
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  const now = Date.now();
+  fs.writeFileSync(path.join(ws, "state", "topics.json"), JSON.stringify({
+    open_topics: [{
+      key: "刚说过的", label: "刚说过的", heat: 0.9,
+      last_at: new Date(now - 0.3 * 3600e3).toISOString(),
+    }],
+  }));
+  const r = cog.cycle(ws, {});
+  const t = (r.ranked || []).find((c) => c.kind === "unresolved");
+  assert.equal(t, undefined, "半小时前的话题不该马上回来");
+});
+
+t("悬着的话题：两小时前、还有热度的要能进来", () => {
+  // 2026-11-07 的缺陷：15 条话题全部落在 0.4–9.4 小时，
+  // 过 0.5 天门槛的 0 条 —— 这个来源从来没产出过候选。
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "topic2-"));
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "state", "topics.json"), JSON.stringify({
+    open_topics: [{
+      key: "悬着的那件", label: "悬着的那件", heat: 0.6,
+      last_at: new Date(Date.now() - 3 * 3600e3).toISOString(),
+    }],
+  }));
+  const r = cog.cycle(ws, {});
+  const t = (r.ranked || []).find((c) => c.kind === "unresolved");
+  assert.ok(t, "三小时前、heat 0.6 的话题应该成为候选");
+});
+
+t("悬着的话题：凉透了的不提，哪怕放得很久", () => {
+  // 放得久不等于还重要。实测那 8 条过了时间门槛的，heat 全是 0.11–0.12,
+  // 是早就不重要、只是没人关掉的话题。再提就是翻旧账。
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "topic3-"));
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "state", "topics.json"), JSON.stringify({
+    open_topics: [{
+      key: "早就不重要了", label: "早就不重要了", heat: 0.11,
+      last_at: new Date(Date.now() - 9 * 3600e3).toISOString(),
+    }],
+  }));
+  const r = cog.cycle(ws, {});
+  const t = (r.ranked || []).find((c) => c.kind === "unresolved");
+  assert.equal(t, undefined, "heat 0.11 的话题不该提");
+});
+
+t("悬着的话题：没有 heat 字段的老数据不被排斥", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "topic4-"));
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "state", "topics.json"), JSON.stringify({
+    open_topics: [{ key: "老数据", label: "老数据", last_at: new Date(Date.now() - 3 * 3600e3).toISOString() }],
+  }));
+  const r = cog.cycle(ws, {});
+  const t = (r.ranked || []).find((c) => c.kind === "unresolved");
+  assert.ok(t, "缺 heat 的历史数据应该照常参与");
+});
+
 console.log(`\ncognition: ${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

@@ -207,9 +207,9 @@ export function describe(workspaceDir, about = null, { limit = 4, aliases = [] }
   // said, not a summary of him. Calling it 「你知道的」 would imply the system has
   // a theory about who he is.
   // Old lines were written by hand or by `remember_about`, and they read like
-  // 「Alice 2026-10-31 说过不喜欢那张表情包」 — the name and the date are inside
+  // 「用户 2026-10-31 说过不喜欢那张表情包」 — the name and the date are inside
   // the text, because there was no `about:` field to put them in. Quoting that
-  // back verbatim produces 「他自己说过的Alice2026-10-31说过…」, which is not his
+  // back verbatim produces 「他自己说过的用户2026-10-31说过…」, which is not his
   // words, it is a log line.
   //
   // Only the leading `name + date` preamble is removed. The rest is left alone on
@@ -217,23 +217,42 @@ export function describe(workspaceDir, about = null, { limit = 4, aliases = [] }
   // said, and the whole point is that it stores his words.
   const stripPreamble = (text) => {
     // Three shapes were found in the live file, and the first attempt at a single
-    // regex handled none of them. It ate `wronged` down to `d（我不是大肥鱼）`
+    // regex handled none of them. It ate `wronged` down to `d（我不是这个角色）`
     // because `[^\s，。]{0,20}` ran through the quoted word looking for a date.
     //
-    //   1. `Alice 2026-10-31 说过…`        name, then date
-    //   2. `Alice 2026-10-31 18:41 定的…`  name, date, clock
-    //   3. `2026-10-31 22:03 起，Alice 要求…`  date first, name after
+    //   1. `用户 2026-10-31 说过…`        name, then date
+    //   2. `用户 2026-10-31 18:41 定的…`  name, date, clock
+    //   3. `2026-10-31 22:03 起，用户 要求…`  date first, name after
     //
     // Anchored on the date token, which is the one thing all three share, and
     // bounded by whitespace or a comma — never by "any non-punctuation run".
     let t = String(text || "").trim();
-    t = t
-      // date-first: `2026-10-31 22:03 起，Alice `
+    // Known names first, and matched literally. The regexes below used to guess
+    // what a name looks like — `[A-Za-z][\w.-]{2,19}` — which silently only
+    // worked for latin handles. Anyone whose name is not latin got the whole
+    // preamble quoted back at them, name included. Exact-match beats guessing.
+    const names = [about, ...(Array.isArray(aliases) ? aliases : [])]
+      .map((n) => String(n || "").trim())
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+    // Order matters. A body can be `name date …` or `date … name …`, so the
+    // date has to come off before the name is matched a second time — one pass
+    // in one order leaves the other shape with the name still in it.
+    const stripName = (s) => {
+      for (const n of names) {
+        const escaped = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        s = s.replace(new RegExp(`^${escaped}\\s*`), "");
+      }
+      return s;
+    };
+    const stripDate = (s) => s
+      // date-first: `2026-10-31 22:03 起，`
       .replace(/^\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?\s*[起后]?\s*[，,]\s*/, "")
-      // name-first: `Alice 2026-10-31 18:41 ` or `Alice 2026-10-31 `
-      .replace(/^\S{1,20}\s+\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?\s*/, "")
-      // leftover name with no date at all: only strip a bare latin handle
-      .replace(/^[A-Za-z][\w.-]{2,19}\s+(?=[\u4e00-\u9fa5])/, "");
+      // name-first: `<name> 2026-10-31 18:41 `
+      .replace(/^\S{1,20}\s+\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?\s*/, "");
+    t = stripName(stripDate(stripName(t)));
+    // last resort: a bare latin handle with no date at all
+    t = t.replace(/^[A-Za-z][\w.-]{2,19}\s+(?=[\u4e00-\u9fa5])/, "");
     // A `定的规矩：` / `要求…` opening loses its subject once the name is gone.
     // Put a light one back so the line reads as a sentence instead of a fragment:
     // 「定的规矩：一个回合发一到两张」 was not something a person says.
@@ -263,7 +282,7 @@ export function known(workspaceDir, about = null, limit = 40, aliases = []) {
   // Which names count as this person.
   //
   // The `about:` field is written with the canonical name from USER.md
-  // (`Alice`), while the live event carries the display name (`用户`). Two
+  // (`用户`), while the live event carries the display name (`用户`). Two
   // names, one man. Exact matching on either one alone loses the other half:
   // measured on the real file, `known(ws, "用户")` returned 0 of 4 records.
   //

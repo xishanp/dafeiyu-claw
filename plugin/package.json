@@ -5,6 +5,15 @@
   "type": "module",
   "main": "index.js",
   "openclaw": {
-    "extensions": ["./index.js"]
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "repository": {
+    "type": "git"
   }
 }

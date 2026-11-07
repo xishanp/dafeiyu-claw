@@ -97,31 +97,31 @@ test("about: 没有 person.md 时不报错", () => {
 });
 
 test("about: 别名能对上同一个人（回归）", () => {
-  // 真实情况：person.md 写的是 Alice，事件里是「用户」，互相都 contains 不到。
+  // 真实情况：person.md 写的是主名（阿鲸），事件里是显示名（用户），互相都 contains 不到。
   // 如果不认别名，她会开始第二份关于同一个人的记忆。
   const ws = tmp();
-  about.remember(ws, { text: "他要求称呼改成用户", about: "Alice", importance: 0.9 });
+  about.remember(ws, { text: "他要求称呼改成用户", about: "阿鲸", importance: 0.9 });
   assert.equal(about.known(ws, "用户").length, 0, "不传别名时对不上，这是旧行为");
-  const withAlias = about.known(ws, "用户", 40, ["Alice"]);
+  const withAlias = about.known(ws, "用户", 40, ["阿鲸"]);
   assert.equal(withAlias.length, 1, "传别名后应认出是同一个人");
 });
 
 test("about: 只认明确列出的名字，不做子串猜测", () => {
   const ws = tmp();
-  about.remember(ws, { text: "我不吃香菜", about: "用户" });
-  assert.equal(about.known(ws, "老").length, 0, "「老」不该匹配到「用户」");
-  assert.equal(about.known(ws, "用户").length, 1);
+  about.remember(ws, { text: "我不吃香菜", about: "阿鲸" });
+  assert.equal(about.known(ws, "老").length, 0, "「老」不该匹配到「阿鲸」");
+  assert.equal(about.known(ws, "阿鲸").length, 1);
 });
 
 test("about: describe 去掉名字和日期，且补回主语", () => {
   const ws = tmp();
   fs.writeFileSync(
     path.join(ws, "memory", "facts", "person.md"),
-    "- 2026-10-31T10:41:47.101Z | about: Alice | importance: 0.85 | 2026-10-31 18:41 起，Alice 定的规矩：一个回合发一到两张。\n",
+    "- 2026-10-31T10:41:47.101Z | about: 阿鲸 | importance: 0.85 | 2026-10-31 18:41 起，阿鲸 定的规矩：一个回合发一到两张。\n",
   );
-  const d = about.describe(ws, "用户", { aliases: ["Alice"] });
+  const d = about.describe(ws, "阿鲸", { aliases: ["阿鲸"] });
   assert.ok(!d.includes("2026-10-31"), `不该带日期：${d}`);
-  assert.ok(!d.includes("Alice"), `不该带名字：${d}`);
+  assert.ok(!d.includes("阿鲸"), `不该带名字：${d}`);
   assert.match(d, /【他自己说过的】他/);
 });
 
@@ -129,20 +129,20 @@ test("about: describe 不把 quoted 词吃掉（回归）", () => {
   const ws = tmp();
   fs.writeFileSync(
     path.join(ws, "memory", "facts", "person.md"),
-    "- 2026-10-31T07:37:58.168Z | about: Alice | importance: 0.7 | Alice 2026-10-31 说过不喜欢「wronged（我不是大肥鱼）」那张。\n",
+    "- 2026-10-31T07:37:58.168Z | about: 阿鲸 | importance: 0.7 | 阿鲸 2026-10-31 说过不喜欢「wronged（我不是小鲸鱼）」那张。\n",
   );
-  const d = about.describe(ws, "用户", { aliases: ["Alice"] });
+  const d = about.describe(ws, "阿鲸", { aliases: ["阿鲸"] });
   assert.match(d, /wronged/, `引号里的词被吃掉了：${d}`);
-  assert.match(d, /我不是大肥鱼/);
+  assert.match(d, /我不是小鲸鱼/);
 });
 
 test("about: 写入用 USER.md 的主名，不是显示名（回归）", () => {
-  // 真实情况：senderName 是「用户」，历史记录全是 Alice。
+  // 真实情况：senderName 是显示名（用户），历史记录全是主名（阿鲸）。
   // 写显示名会让同一个人变成两个 owner，老偏好全部失联。
   const ws = tmp();
-  fs.writeFileSync(path.join(ws, "USER.md"), "- 称呼：Alice（用户）\n");
-  about.remember(ws, { text: "我特别讨厌香菜", about: "Alice", tag: "讨厌" });
+  fs.writeFileSync(path.join(ws, "USER.md"), "- 称呼：阿鲸\n");
+  about.remember(ws, { text: "我特别讨厌香菜", about: "阿鲸", tag: "讨厌" });
   const lines = fs.readFileSync(path.join(ws, "memory", "facts", "person.md"), "utf8");
-  assert.match(lines, /about: Alice/);
+  assert.match(lines, /about: 阿鲸/);
   assert.ok(!/about: 用户/.test(lines), "不该写成显示名");
 });

@@ -18,7 +18,7 @@ const FILE_VERSION = 1;
 // 一次都不会执行，数值永远停在原地。2026-11-04 实测：安奈 152 次互动涨到
 // 0.947，此后不再出现，一个月后仍然是 0.947。
 //
-// 目标（2026-11-04 用户定的）：0.9 的人断联 7 天要落到 0.4 左右。
+// 目标：0.9 的人断联 7 天要落到 0.4 左右。
 // （0.9 - 0.4）/ 7 = 0.0714/天。取 0.07。
 //
 // 对照：
@@ -285,6 +285,54 @@ export function addNote(workspaceDir, personId, text) {
 }
 
 /** People we actually know, most familiar first. */
+/**
+ * Lower a relationship on purpose.
+ *
+ * Why this exists
+ * ---------------
+ * Before this, every number in relations.json could only be changed by two
+ * forces: someone speaking (up) and elapsed time (down to the floor). She had no
+ * say in either. That is the difference between "the system says I am close to
+ * this person" and "I decided I am not".
+ *
+ * Measured 2026-11-06: person:onebot:10001 was familiarity 1.00 / trust
+ * 1.00 after 755 interactions, and the four groups were all 0.02 with no path
+ * upward or downward that she could take. A character with nothing she can
+ * withdraw has nothing at stake, and a character with nothing at stake has no
+ * reason to leave a room, ask for anything, or care who answers.
+ *
+ * `trust` moves less than `familiarity` on purpose: being tired of someone does
+ * not retroactively make their past honest moments false. Pulling familiarity
+ * down while trust stays put is exactly the state of "I know you well and I
+ * currently do not want to".
+ */
+export function withdraw(workspaceDir, { id, amount = 0.15, why = "" } = {}) {
+  const key = String(id || "").trim();
+  if (!key) return { ok: false, reason: "没说要疏远谁" };
+  const { file, data } = loadRelations(workspaceDir);
+  const rec = data.people[key] || data.groups[key];
+  if (!rec) return { ok: false, reason: "没有这个人的记录" };
+
+  const drop = clamp(amount, 0.02, 0.5);
+  const before = Number(rec.familiarity ?? 0);
+  const after = Math.max(0.02, before - drop);
+  if (after === before) return { ok: false, reason: "已经是最近的了" };
+
+  rec.familiarity = after;
+  rec.sentiment = clamp((rec.sentiment ?? 0) - drop * 0.6, -1, 1);
+  // A withdrawal is itself an event she caused; recording it means the next wake
+  // can see that the distance was chosen rather than noticed.
+  if (!Array.isArray(rec.notes)) rec.notes = [];
+  rec.notes.push({
+    at: new Date().toISOString(),
+    note: `疏远 ${before.toFixed(2)} → ${after.toFixed(2)}${why ? `：${why}` : ""}`,
+  });
+  rec.notes = rec.notes.slice(-20);
+
+  saveRelations(file, data);
+  return { ok: true, before, after, name: rec.name || null };
+}
+
 export function topPeople(workspaceDir, limit = 10) {
   const { data } = loadRelations(workspaceDir);
   return Object.values(data.people)

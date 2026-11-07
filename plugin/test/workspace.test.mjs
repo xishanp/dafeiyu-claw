@@ -430,5 +430,155 @@ t("只有 self 这一条背景候选时沉默（solo_background 规则覆盖它�
   assert.equal(r.winner?.key, "self:state");
 });
 
+// ---------------------------------------------------------------- 为什么输
+
+t("排第一的有 why，说清是本来就强还是被压过", () => {
+  const dir = ws();
+  const r = attention.compete(dir, {
+    goal: { id: "g1", title: "画那盏灯" },
+    aspiration: { id: "a", title: "做出以前没有的东西", value: 0.3 },
+  });
+  assert.ok(r.winner, "应该有赢家");
+  assert.ok(r.winner.why, "赢家要有 why");
+  assert.ok(typeof r.winner.why === "string");
+});
+
+t("被习惯化压下去的候选，why 要能分辨出来", () => {
+  // 这是加 why 的核心目的：分数低有两种完全不同的原因。
+  // 「本来就不重要」和「最近想太多了」在分数上长得一样，
+  // 但对下一步的含义相反 —— 后者还重要，只是该歇一下。
+  const dir = ws();
+  const input = {
+    goal: { id: "g1", title: "画那盏灯" },
+    aspiration: { id: "output_producing", title: "做出以前没有的东西", value: 0.5 },
+  };
+  // 先让它连着赢几轮，累积重复惩罚
+  for (let i = 0; i < 4; i += 1) attention.compete(dir, input);
+  const r = attention.compete(dir, input);
+  const pressured = [...(r.ranked || [])].find((c) => c.penalty >= 0.2);
+  if (pressured) {
+    assert.ok(
+      /想太多|压掉/.test(pressured.why || ""),
+      `被压过的候选 why 应说明这一点，实际是「${pressured.why}」`,
+    );
+  }
+});
+
+t("runnerUp 拿的是自己的 why，不是赢家的", () => {
+  const dir = ws();
+  const r = attention.compete(dir, {
+    userTurn: { text: "在吗" },
+    goal: { id: "g1", title: "画那盏灯" },
+  });
+  if (r.runnerUp && r.winner) {
+    assert.notEqual(r.runnerUp.key, r.winner.key);
+    assert.ok(r.runnerUp.why, "runnerUp 也要有 why");
+  }
+});
+
+t("render 遇到「差一点」的 runnerUp，措辞不是「不重要」", () => {
+  const rendered = attention.render({
+    winner: { text: "有人在跟你说话" },
+    runnerUp: { key: "goal:g1", kind: "goal", label: "画那盏灯", why: "就差一点" },
+  });
+  assert.ok(rendered.includes("差一点") || rendered.includes("先让给你"),
+    `应体现接近，实际：${rendered}`);
+  assert.ok(!rendered.includes("先放着") || rendered.includes("差一点"),
+    "不该只说「先放着」");
+});
+
+t("同分情况下，被压过的那个必须说「想太多」，没被压的不能说", () => {
+  // 直接构造两条候选，一条有重复惩罚一条没有，让它们分差极小。
+  // 上一条测试依赖真实累积，可能没走到那个分支；这条不依赖运气。
+  const dir = ws();
+  const input = { goal: { id: "g1", title: "老想的" }, aspiration: { id: "a1", title: "新的", value: 0.8 } };
+  for (let i = 0; i < 3; i += 1) attention.compete(dir, { goal: { id: "g1", title: "老想的" } });
+  const r = attention.compete(dir, input);
+  const punished = (r.ranked || []).find((c) => c.penalty > 0.05);
+  assert.ok(punished, "应该有一条被压过");
+  assert.ok(punished.penalty >= 0.2, `想要走到「本来够」分支，惩罚要够大，实际 ${punished.penalty}`);
+  const gap = (r.winner?.score ?? 0) - punished.score;
+  if (punished.penalty > gap) {
+    assert.ok(/想太多|压掉/.test(punished.why || ""), `应为「想太多」类，实际「${punished.why}」`);
+  }
+});
+
+t("前两名分数持平时，第二条被标记为 contested", () => {
+  // 「差一点」和「差不多想」不是一回事。前者是"略输"，后者是"还没决定"。
+  const data = attention.load ? { recent: [] } : { recent: [] };
+  const ranked = attention.rank(data, [
+    { key: "a", kind: "goal", salience: 0.6, text: "A", label: "A" },
+    { key: "b", kind: "goal", salience: 0.58, text: "B", label: "B" },
+    { key: "c", kind: "goal", salience: 0.1, text: "C", label: "C" },
+  ]);
+  assert.equal(ranked[1].contested, true, "差 0.02 应标记 contested");
+  assert.ok(!ranked[2].contested, "差得远的不该标记");
+});
+
+t("分差明显时不标记 contested", () => {
+  const ranked = attention.rank({ recent: [] }, [
+    { key: "a", kind: "goal", salience: 0.8, text: "A", label: "A" },
+    { key: "b", kind: "goal", salience: 0.4, text: "B", label: "B" },
+  ]);
+  assert.ok(!ranked[1].contested, "差 0.4 不该算纠结");
+});
+
+t("render 对 contested 的 runnerUp 说「两个都行」，不说「先放着」", () => {
+  const rendered = attention.render({
+    winner: { text: "在想 A" },
+    runnerUp: { key: "b", kind: "goal", label: "B", contested: true, why: "就差一点" },
+  });
+  assert.ok(rendered.includes("两个都行") || rendered.includes("差不多"),
+    `应体现两边都行，实际：${rendered}`);
+  assert.ok(!rendered.includes("先放着"), "平手时不该说先放着");
+});
+
+// ---------------------------------------------------------------- 连击
+
+t("streakOf: 连着同一个才是连击", () => {
+  const data = { recent: [
+    { key: "a" }, { key: "a" }, { key: "b" }, { key: "b" }, { key: "b" },
+  ]};
+  const s = attention.streakOf(data);
+  assert.equal(s.key, "b");
+  assert.equal(s.count, 3);
+});
+
+t("streakOf: silence 不算换人，也不计入连击", () => {
+  // 一轮没说话不代表念头换了。把它当断点会让连击永远数不起来。
+  const data = { recent: [
+    { key: "a" }, { key: "__silence__" }, { key: "a" }, { key: "a" },
+  ]};
+  const s = attention.streakOf(data);
+  assert.equal(s.key, "a");
+  assert.equal(s.count, 3, "三处 a，silence 跳过");
+});
+
+t("streakOf: 空窗口返回 count 0", () => {
+  const s = attention.streakOf({ recent: [] });
+  assert.equal(s.count, 0);
+  assert.equal(s.key, null);
+});
+
+t("render: 连击到 5 轮才说，4 轮不说", () => {
+  const four = attention.render({
+    winner: { text: "在想 A" },
+    streak: { key: "a", count: 4 },
+  });
+  assert.ok(!four.includes("连着"), "4 轮还不该提");
+  const five = attention.render({
+    winner: { text: "在想 A" },
+    streak: { key: "a", count: 5 },
+  });
+  assert.ok(five.includes("连着") && five.includes("5"), `5 轮应提，实际：${five}`);
+});
+
+t("render: 连击那句话不给建议", () => {
+  // 连续同一个可能是真在推进，也可能是池子空了。从外面看不出来，
+  // 所以只陈述，不说「该换换了」。
+  const r = attention.render({ winner: { text: "在想 A" }, streak: { key: "a", count: 7 } });
+  assert.ok(!/换|别|应该/.test(r.split("）")[1] || ""), `不该给建议：${r}`);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

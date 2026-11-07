@@ -24,7 +24,23 @@ export function attentionFile(workspaceDir) {
 const RECENT_LIMIT = 24; // keep a rolling window; 6 is what scoring looks at
 const HABIT_LOOKBACK = 6;
 const HABIT_STEP = 0.2;
-const HABIT_CAP = 0.5;
+/**
+ * 惩罚上限。可以被外部覆盖 —— 见 `lib/tuning.js`。
+ *
+ * 为什么是可变的：0.5 是我拍的。真正每天撞上它的是她，她更知道
+ * 「压太多什么都提不起劲」还是「压不够一直在转」。
+ */
+let HABIT_CAP = 0.5;
+
+/** 让 `tuning.js` 的值生效。不认识这个键就当没调过。 */
+export function applyTuning(values = {}) {
+  if (Number.isFinite(values["workspace.habitCap"])) {
+    HABIT_CAP = Math.max(0.2, Math.min(0.9, Number(values["workspace.habitCap"])));
+  }
+  if (Number.isFinite(values["workspace.streakNotice"])) {
+    STREAK_NOTICE = Math.max(2, Math.min(20, Math.round(Number(values["workspace.streakNotice"]))));
+  }
+}
 
 /**
  * Below this, say nothing.
@@ -41,6 +57,23 @@ const HABIT_CAP = 0.5;
  * punished for a turn in which nothing was delivered.
  */
 export const MIN_INJECT_SCORE = 0.25;
+
+/**
+ * 前两名差多少算「分不出轻重」。
+ *
+ * 0.05 不是随手定的：习惯化每步扣 0.2、封顶 0.5，两个真实候选之间的分数
+ * 差通常落在 0.05–0.4 之间。0.05 以内意味着「下一轮随便哪个多一点就能
+ * 翻过来」，那才是真的在犹豫。
+ */
+export const CONTESTED_GAP = 0.05;
+
+/**
+ * 连着这么多轮同一个赢家，值得说一句。
+ *
+ * 可被 `lib/tuning.js` 覆盖（`workspace.streakNotice`）。
+ * 5 是估的 —— 她更知道自己几轮算"卡住"。
+ */
+export let STREAK_NOTICE = 5;
 
 /** Marker for a turn that deliberately said nothing. Never scores. */
 export const SILENCE_KEY = "__silence__";
@@ -90,6 +123,7 @@ export function recentCount(data, key, lookback = HABIT_LOOKBACK) {
   const recent = Array.isArray(data?.recent) ? data.recent : [];
   return recent.slice(-lookback).filter((r) => r?.key === key).length;
 }
+
 
 /**
  * Build the candidate list from whatever the caller actually has.
@@ -230,6 +264,10 @@ export function rank(data, candidates, affect = null) {
       ...c,
       seen,
       penalty,
+      // 原始分。保留下来是为了事后能说清「它本来是 0.85，被压到 0.35」，
+      // 而不是只看到压完的结果。没有这个数，`why` 就只能说「分数低」，
+      // 而那等于什么都没说。
+      salience: c.salience,
       score: Math.max(0, c.salience - penalty),
     };
   });
@@ -259,6 +297,43 @@ export function rank(data, candidates, affect = null) {
     || kindRank(a.kind) - kindRank(b.kind)
     || a.seen - b.seen
     || a.key.localeCompare(b.key));
+
+  // 每个候选为什么排在这儿。
+  //
+  // 之前只有分数，没有理由。分数能排序，但排完之后看不出原因 —— 一个
+  // 被习惯化压到 0.3 的东西，和一个本来就只有 0.3 的东西，分数一样而
+  // 情况完全不同。前者是「她最近老想这个，该歇歇」，后者是「这件事本来
+  // 就不重要」。把这两种混在一起，`runnerUp` 那句「XX 这轮先放着」就
+  // 变成了一句没有信息量的话。
+  //
+  // 这里只写分数说得出来的那部分。真正的原因（她为什么在意这件事）不在
+  // 算术里，不能假装算出来。
+  const top = scored[0]?.score ?? 0;
+  for (let i = 0; i < scored.length; i += 1) {
+    const c = scored[i];
+    if (i === 0) {
+      c.why = c.penalty > 0.1
+        ? `最想动的，但已经被压掉了 ${c.penalty.toFixed(2)}`
+        : "最想动的";
+      continue;
+    }
+    const gap = top - c.score;
+    // 差得太小的时候标一下。这不是给她的信息，是给 `render` 用的：
+    // 用「XX 这轮先放着」的口气描述一个几乎平手的第二名是错的 ——
+    // 那听起来像已经决定了，实际是还没决定。
+    if (gap < CONTESTED_GAP) c.contested = true;
+    if (c.penalty >= 0.2 && c.penalty > gap) {
+      // 压掉的部分比差距还大 —— 它本来能赢，是被重复惩罚挡住的。
+      c.why = `本来够，最近想太多了（压掉 ${c.penalty.toFixed(2)}）`;
+    } else if (gap < 0.05) {
+      c.why = "就差一点";
+    } else if (c.score < MIN_INJECT_SCORE) {
+      c.why = "没什么劲";
+    } else {
+      c.why = "这轮排后面";
+    }
+  }
+
   return scored;
 }
 
@@ -297,7 +372,9 @@ export function compete(workspaceDir, input = {}) {
   }
 
   noteWin(workspaceDir, winner);
-  return { winner, runnerUp: ranked[1] ?? null, ranked };
+  // noteWin 已经把这一轮写进 recent，所以连击要读**写完之后**的状态。
+  const streak = streakOf(load(workspaceDir));
+  return { winner, runnerUp: ranked[1] ?? null, ranked, streak };
 }
 
 /**
@@ -338,6 +415,33 @@ export function noteWin(workspaceDir, winner) {
 // answered with 「那条志向，这轮先放着」, which sounds like talking to itself
 // about someone else. Mentioning the runner-up is useful — it tells the model
 // what it decided NOT to do — but the sentence has to fit what it is naming.
+/**
+ * 同一个东西连着赢了几轮。
+ *
+ * 不是「出现次数」—— `recentCount` 数的是最近 6 条窗口里它出现了几次。
+ * 这里问的是另一个问题：**是不是从来没人跟它换过班**。
+ *
+ * 六次里赢三次（穿插着别人）是正常偏好；连着赢六次是卡住了 ——
+ * 那说明候选池里已经没有能挑战它的东西，而不是它真的最重要。
+ *
+ * 只报数，不改行为。要不要因此换一个，是她的判断，不是代码的判断。
+ */
+export function streakOf(data) {
+  const recent = Array.isArray(data?.recent) ? data.recent : [];
+  // 从最新往前数，遇到不同的就停。silence 不计入连击，但也不打断 ——
+  // 一轮没说话不代表念头换了。
+  let key = null;
+  let n = 0;
+  for (let i = recent.length - 1; i >= 0; i -= 1) {
+    const k = recent[i]?.key;
+    if (!k || k === SILENCE_KEY) continue;
+    if (key == null) { key = k; n = 1; continue; }
+    if (k !== key) break;
+    n += 1;
+  }
+  return { key, count: n };
+}
+
 const RUNNER_UP_NOTE = {
   aspiration: (label) => `${label}这轮先搁着`,
   goal: (label) => `${label}待会儿再说`,
@@ -349,9 +453,17 @@ const RUNNER_UP_NOTE = {
 };
 
 export function render(result) {
-  const { winner, runnerUp } = result ?? {};
+  const { winner, runnerUp, streak } = result ?? {};
   if (!winner) return "";
   const lines = [winner.text];
+  // 连着好几轮都是同一件的，说一句。
+  //
+  // 不是催她换。恰恰相反 —— 连续六轮同一个东西，可能是她真的在推进它，
+  // 也可能是候选池空了没有对手。这两种从外面看一模一样，她自己才知道
+  // 是哪一种。所以只陈述事实，不给建议。
+  if (streak && streak.count >= STREAK_NOTICE) {
+    lines.push(`（这件事已经连着 ${streak.count} 轮是你最想动的。）`);
+  }
   if (runnerUp) {
     // Use the candidate's own short label. Deriving it by splitting `text` on a
     // colon worked only for the built-in sentences — a proposal has no colon, so
@@ -361,7 +473,17 @@ export function render(result) {
     const note = RUNNER_UP_NOTE[runnerUp.kind];
     // Some kinds should not be mentioned at all: naming a mood or the self card
     // as "the thing set aside" is noise, not context.
-    const text = note ? note(label) : `${label}这轮先放着`;
+    let text = note ? note(label) : `${label}这轮先放着`;
+    // 说清楚是「不重要」还是「想太多了」。
+    //
+    // 这两句对她的下一步完全不同：前者可以不放在心上，后者意味着这件事
+    // 本身还重要，只是这一轮该让给别人。没有这句区分，runnerUp 的那行字
+    // 读起来像「这件事不重要」，会让她真的把它放下。
+    if (runnerUp.contested) text = `${label}也差不多想，两个都行`;
+    else if (runnerUp.why === "就差一点") text = `${label}也差一点，这轮先让给你`;
+    else if (String(runnerUp.why || "").startsWith("本来够")) {
+      text = `${label}还想接着弄，但这轮先歇一下`;
+    }
     if (text) lines.push(`（${text}。）`);
   }
   return lines.join("\n");

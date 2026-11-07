@@ -69,7 +69,7 @@ function silenceLine(lastInboundAt) {
 }
 
 /** Build the one-line context block injected before the model speaks. */
-export { todayIn };
+export { todayIn, shanghaiParts };
 // Which outfit is on right now.
 //
 // IDENTITY.md describes both, so the model had to work out "am I in the day

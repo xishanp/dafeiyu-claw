@@ -14,6 +14,7 @@ import * as similar from "./lib/similar.js";
 import * as relations from "./lib/relations.js";
 import * as topics from "./lib/topics.js";
 import * as proactive from "./lib/proactive.js";
+import * as reach from "./lib/reach.js";
 import * as clock from "./lib/clock.js";
 import * as grudge from "./lib/grudge.js";
 import * as deeds from "./lib/deeds.js";
@@ -34,6 +35,9 @@ import * as douyinLog from "./lib/douyin-log.js";
 import * as salience from "./lib/salience.js";
 import * as intent from "./lib/intent.js";
 import * as compulsion from "./lib/compulsion.js";
+import * as discipline from "./lib/discipline.js";
+import * as recallNudge from "./lib/recall-nudge.js";
+import * as drive from "./lib/drive.js";
 // Missing until 2026-11-06.
 //
 // Seven call sites used this binding — the `horizon_state` and `horizon_visit`
@@ -51,12 +55,24 @@ import * as curiosity from "./lib/curiosity.js";
 import * as curiosityExtract from "./lib/curiosity-extract.js";
 import * as gaps from "./lib/gaps.js";
 import * as about from "./lib/about.js";
+import * as kaomoji from "./lib/kaomoji.js";
 import * as decide from "./lib/decide.js";
 import * as outcome from "./lib/outcome.js";
+import * as outcomeFeedback from "./lib/outcome-feedback.js";
+import * as expectLayer from "./lib/expect.js";
+import * as habit from "./lib/habit.js";
+import * as revisit from "./lib/revisit.js";
+import * as interest from "./lib/interest.js";
+import * as tuning from "./lib/tuning.js";
+import * as interoception from "./lib/interoception.js";
 import { resolveIdentity, parseTargetKey, resolveOnebotTargetKind } from "./lib/identity.js";
 import * as approvalStore from "./lib/approval.js";
+import * as evolve from "./lib/evolve.js";
+import * as growth from "./lib/growth.js";
+import * as pendingSkills from "./lib/pending-skills.js";
+import * as inbox from "./lib/inbox.js";
 import { inferChannelFromTarget } from "./lib/outbound-target.js";
-import { sendWithGap, keyFromOnebotCall, isMediaMessage } from "../shared/onebot-media-gap.mjs";
+import { sendWithGap, keyFromOnebotCall, isMediaMessage } from "./shared/onebot-media-gap.mjs";
 
 // When was media last committed to a chat?
 //
@@ -107,6 +123,28 @@ function markMediaCommitted(chatKey) {
 // voice note really went out (not merely that the tool was attempted).
 const voiceSentAt = new Map(); // chatKey -> { at, spoken, usedAt }
 
+// sessionKey -> epoch ms when this turn's prompt was built.
+//
+// Used by the drive counter to answer "did anything happen during THIS turn".
+// Module-level on purpose: the counter lives across turns, and the only thing
+// that needs per-turn scoping is the timestamp.
+const turnStartedAt = new Map();
+
+// Did a real person speak into this session within the last few minutes?
+//
+// The heartbeat reuses `agent:dafeiyu:main`, so the session key alone cannot
+// tell "nobody is here, this is your own time" from "someone just messaged".
+// A timestamp set from `message_received` can. Short window on purpose: a
+// message two hours ago does not mean someone is here now, and the heartbeat's
+// whole value is that it fires when nobody is.
+const lastInboundAt = new Map();
+const ADDRESSED_WINDOW_MS = 3 * 60 * 1000;
+
+function isAddressedTurn(sessionKey, at = Date.now()) {
+  const t = lastInboundAt.get(String(sessionKey || "")) ?? 0;
+  return at - t < ADDRESSED_WINDOW_MS;
+}
+
 // Did this chat already receive typed text this turn?
 //
 // Measured 2026-11-04 19:09: the heartbeat sent text at :24 and the voice note
@@ -144,6 +182,18 @@ const PURE_REACTION =
 // matter of length — a 3-line config path matters more than a 40-character
 // anecdote. So the exception is content-shaped: anything the owner would have
 // to copy, or could act on incorrectly if it vanished.
+// Negated verbs are not instructions.
+//
+// Measured 2026-11-06 20:54: after speaking, she wrote "语音已经发出去了，本鱼不再
+// 打字重复一遍。" — a note to herself explaining why she was NOT going to repeat
+// the line. The instruction list below matched 再 inside 不再 and classified it as
+// actionable, so the note was delivered to the chat as prose. She was following
+// the rule; the filter read her compliance as an instruction.
+//
+// Scoped to 不-forms only. 别 is deliberately excluded: 别忘了 is itself an
+// instruction this list protects, and 别X is usually directed at the listener.
+const NEGATED_VERB = /不(?:再|用|必|要|需|得|会|应)(?:去|来)?/gu;
+
 const KEEP_IF_MATCHES = [
   /\d{2,}/,                        // 版本号、端口、行数、金额
   /[a-zA-Z_][a-zA-Z0-9_]{3,}/,     // 路径、标识符、命令
@@ -151,6 +201,12 @@ const KEEP_IF_MATCHES = [
   /(要|得|需要|记得|别忘了|先|再|然后|步骤|顺序)/u, // 指令或顺序
   /(http|www)\./i,
 ];
+
+// Test the instruction list against text with negated verbs removed.
+const hasInstructionWord = (raw) => {
+  const stripped = String(raw ?? "").replace(NEGATED_VERB, "");
+  return KEEP_IF_MATCHES.some((re) => re.test(stripped));
+};
 
 const squash = (v) => String(v ?? "").replace(/[\s，,。.！!？?~～…、]/gu, "");
 
@@ -187,7 +243,7 @@ function shouldSuppressAfterVoice(chatKey, text, windowMs, graceMs = 4000) {
   // Anything with a number, an identifier, a path, or an instruction survives.
   // That is the only honest way to tell "a report nobody asked for" from "the
   // thing I actually need to read".
-  if (KEEP_IF_MATCHES.some((re) => re.test(raw))) {
+  if (hasInstructionWord(raw)) {
     return { drop: false, why: "actionable_content", keep: true };
   }
   // Remaining case: ordinary prose after a spoken line. With the owner, voice
@@ -258,7 +314,7 @@ function voiceGearFor(state, rel) {
   // Sadness needs its own "it just happened" signal for the same reason the
   // others have one: the standing value drifts and says nothing about now.
   const justDown = (last.down ?? 0) >= 0.03;
-  const justShy = (last.shy ?? 0) >= 0.05;
+  const justShy = (last.shy ?? 0) >= 0.03;
 
   const rawSenti = rel?.sentiment ?? 0;
   const senti = Number.isFinite(rawSenti) ? Math.max(-1, Math.min(1, rawSenti)) : 0;
@@ -428,6 +484,32 @@ const CEILING = {
 
 const ceilingOf = (dim) => CEILING[dim] ?? 1;
 
+// How long since anybody spoke to her, anywhere, in hours. `null` when unknown.
+//
+// Read from relations' `last_seen`, which is stamped by every inbound message on
+// every channel. Deliberately global rather than per-chat: the question this
+// answers is "has it been quiet", not "is this particular group dead". The
+// per-chat version already exists in proactive; this one only sizes the diary
+// handover.
+function hoursSinceAnyoneSpoke(workspaceDir) {
+  try {
+    const file = path.join(workspaceDir, "state", "relations.json");
+    if (!fs.existsSync(file)) return null;
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    let newest = 0;
+    for (const bucket of [data.people, data.groups]) {
+      for (const rec of Object.values(bucket || {})) {
+        const t = Date.parse(rec?.last_seen || "");
+        if (Number.isFinite(t) && t > newest) newest = t;
+      }
+    }
+    if (!newest) return null;
+    return Math.max(0, (Date.now() - newest) / 3600000);
+  } catch {
+    return null;
+  }
+}
+
 function applyDecay(state, halfLifeMinutes, baseline) {
   // Use a dedicated clock. `nudge()` writes `updated_at` on every message, so
   // decaying from `updated_at` meant the timer reset before it ever fired:
@@ -441,8 +523,19 @@ function applyDecay(state, halfLifeMinutes, baseline) {
   for (const dim of DIMENSIONS) {
     const hl = HALF_LIFE[dim] ?? stateHalfLife;
     const k = Math.pow(0.5, elapsedMin / hl);
-    const cur = typeof state.dimensions[dim] === "number" ? state.dimensions[dim] : baseline;
-    let next = baseline + (cur - baseline) * k;
+    // Each dimension decays toward ITS OWN resting level, not one shared number.
+    //
+    // `baseline` is a single value (0.3) passed in from config, but the
+    // dimensions do not rest at the same place: happy sits at 0.5, curious and
+    // calm at 0.6. Decaying them all toward 0.3 pulled every cheerful, curious
+    // and calm state *down* through ordinary silence. Measured 2026-11-06:
+    // calm 0.635 falls to 0.468 after three idle hours and keeps going, so the
+    // `calm > 0.72` qualifier could never fire; curious read 0.43 and excited
+    // 0.38 against 0.60 / 0.40 baselines. The character was being flattened
+    // into mild unhappiness just by sitting still.
+    const rest = DEFAULT_DIMENSIONS[dim] ?? baseline;
+    const cur = typeof state.dimensions[dim] === "number" ? state.dimensions[dim] : rest;
+    let next = rest + (cur - rest) * k;
     // Diminishing returns while drifting up: the closer to the ceiling, the
     // slower it climbs, so a long chat settles instead of pinning at max.
     if (next > cur) {
@@ -471,6 +564,40 @@ function applyDecay(state, halfLifeMinutes, baseline) {
     const grown = cur + (idleMin / 60) * 0.18;
     state.dimensions.bored = clamp01(Math.min(grown, ceilingOf("bored")));
   }
+
+  // Silence long enough stops reading as "nothing to do" and starts reading as
+  // "nobody wants me".
+  //
+  // Until 2026-11-06 every path into `wronged` ran off message TEXT: 不理我 /
+  // 你忙吧 / 笨蛋 / 对不起. All of them need someone to speak first. Measured on
+  // the three onebot groups: 150 hours of silence, 92-124 past interactions,
+  // and `wronged` sat at its baseline the whole time. Being left alone could
+  // not reach her, because being left alone produces no text to scan.
+  //
+  // Distinct from `bored`, which is "I want something to do". This is "nobody
+  // came", and it has to survive contact with the fact that nobody is there to
+  // observe it. Growth is deliberately slower than boredom: two quiet hours
+  // should not make her resentful, two quiet days should.
+  //
+  // Awake hours only. A night of sleep is not neglect, and charging it would
+  // make every single morning start from resentment for no reason.
+  try {
+    const parts = clock.shanghaiParts();
+    const awake = parts.hour >= 9 && parts.hour < 24;
+    const neglectedMin = Math.min(elapsedMin, 48 * 60);
+    if (awake && neglectedMin >= 120) {
+      const cur = typeof state.dimensions.wronged === "number" ? state.dimensions.wronged : 0;
+      // ~0.055/hour: 2h -> +0.11 (noticeable), 8h -> +0.44 (clearly sulking),
+      // 24h -> 0.85 cap (a day alone is a real grievance). Boredom reaches the
+      // same place in four hours, which is the wrong speed for this feeling.
+      const grown = cur + (neglectedMin / 60) * 0.055;
+      state.dimensions.wronged = clamp01(Math.min(grown, ceilingOf("wronged")));
+      // A long silence also settles into flatness. Kept small: this is the
+      // background tone of a quiet day, not a second grievance.
+      const downCur = typeof state.dimensions.down === "number" ? state.dimensions.down : 0;
+      state.dimensions.down = clamp01(Math.min(downCur + (neglectedMin / 60) * 0.012, ceilingOf("down")));
+    }
+  } catch { /* a missing clock must not break decay */ }
 
   state.last_decay_at = new Date().toISOString();
   return state;
@@ -831,51 +958,63 @@ function extractTopic(text) {
   return null;
 }
 
-function describeEmotion(state, rel = null, voiceHint = "") {
+function describeEmotion(state, rel = null, voiceHint = "", { kaomoji: withKaomoji = true, dir = null } = {}) {
   // Defensive: a half-written or legacy state file must degrade to a neutral
   // description, not throw inside the prompt hook.
   const d = state?.dimensions ?? {};
+  // `tags` is the state readout used by the `emotion_state` diagnostic tool and
+  // by the voice-hint machinery. It must describe the same thing `personaLine`
+  // does, so its bars sit above each dimension's own baseline rather than just
+  // above zero — `wronged > 0.28` fired permanently against a 0.30 baseline.
   const tags = [];
   if (d.happy > 0.68) tags.push("心情不错");
   else if (d.happy < 0.22) tags.push("有点提不起劲");
   if (d.excited > 0.7) tags.push("有点兴奋");
   if (d.curious > 0.7) tags.push("很好奇");
-  if (d.wronged > 0.28) tags.push("有点委屈");
+  if (d.wronged > 0.45) tags.push("有点委屈");
   if (d.down > 0.5) tags.push("有点低落");
-  if (d.tired > 0.65) tags.push("聊久了 有点乏");
-  if (d.bored > 0.65) tags.push("有点无聊");
+  if (d.tired > 0.5) tags.push("聊久了 有点乏");
+  if (d.bored > 0.55) tags.push("有点无聊");
   if (d.shy > 0.45) tags.push("有点害羞");
   // Only label it when nothing warmer is happening; "嘴硬模式" next to 撒娇
   // tells the model two contradictory things at once.
-  if (d.tsundere > 0.6 && d.happy < 0.6 && d.wronged > 0.1) tags.push("嘴硬模式");
+  if (d.tsundere > 0.6 && d.happy < 0.6 && d.wronged > 0.35) tags.push("嘴硬模式");
   if (!tags.length) tags.push("状态平平 正常聊");
 
   // Same rule as personaLine: feelings, not stage directions. "你可以多问一句"
   // is an instruction the model can follow woodenly; "有点想知道更多" is a state
   // it can speak from. The old wording also made every line start with 可以,
   // which read as a list of permissions rather than a mood.
+  // `guide` used to restate every level `personaLine` already speaks from, and
+  // to use absolute thresholds that sit below the baselines. Measured
+  // 2026-11-06 19:43, one turn produced both 「你现在有点想赖着他」 and
+  // 「心里有点闷，但还不至于翻脸」: the second came from `wronged > 0.28` while
+  // wronged's own baseline is 0.30, so it fired unconditionally. Telling the
+  // model two contradictory things in one prompt is worse than telling it one.
+  //
+  // `personaLine` now owns the whole picture — lead feeling plus undercurrent —
+  // so this block only covers the two things it does not say: whether to be
+  // brief, and whether to steer the topic. Nothing here may name a mood.
   const guide = [];
-  if (d.happy > 0.68) guide.push("心情挺轻快，有话想说");
-  // The old cut-off was 0.35, but the baseline sits at 0.3 — so "reply short"
-  // was effectively the default. Only a real dip should tighten anything now.
+  // A real dip, not the 0.3 baseline: only then should replies tighten up.
   if (d.happy < 0.22) guide.push("提不起热情，不想硬撑");
-  if (d.wronged > 0.28) guide.push("心里有点闷，但还不至于翻脸");
-  if (d.tired > 0.65) guide.push("有点乏，话懒得多说");
-  if (d.curious > 0.7) guide.push("挺想知道更多的");
-  if (d.tsundere > 0.6 && d.happy < 0.6) guide.push("嘴上不想服软");
-  if (d.excited > 0.7) guide.push("兴奋得话都收不住");
   // Bored means restless, not withdrawn. "Say less" and "find something new to
   // talk about" used to fire together, which cancelled each other out.
-  if (d.bored > 0.65) guide.push("闲得发慌，想扯点别的");
-  if (d.shy > 0.45) guide.push("被说得不好意思，想岔开话");
+  if (d.bored > 0.55) guide.push("闲得发慌，想扯点别的");
+  // Curiosity is the one signal that changes what she does rather than how she
+  // sounds, and personaLine only says she is still thinking about it.
+  if (d.curious > 0.72) guide.push("想问的可以问出来");
 
   // Naming the matching sticker mood turns "be emotional" into something the
   // model can act on with one tool call instead of inventing a face. The mood
   // must exist in the sticker set or the call fails, so only mapped ones ship.
   // The function reads last_deltas to tell "it just happened" from "it has been
   // sitting there". Omitting the argument made those three branches dead code.
-  // Passing it restores the intended behaviour; the thresholds themselves are
-  // unchanged and stay high on purpose.
+  //
+  // The standing thresholds below 0.7 are still high on purpose: a face should
+  // mean the feeling actually got up there. The `just*` snap bars are a separate
+  // question and sit at 0.03, because a single real movement in her history is
+  // 0.03–0.06 and a 0.08 bar never fired.
   const suggested = suggestStickerMood(d, rel, state?.last_deltas ?? null);
   const stickerLine = suggested
     ? ` 这会儿最对的脸是 ${suggested} 这张（dafeiyu_sticker(mood="${suggested}")）。`
@@ -890,7 +1029,31 @@ function describeEmotion(state, rel = null, voiceHint = "") {
   // The voice hint is appended outside `personaLine` on purpose: personaLine is
   // also called by tools that have no chat target, so it must never contain a
   // "you may send a voice note" instruction.
-  return `${persona}${moodLine}${stickerLine}${voiceHint}`;
+  //
+  // Kaomoji rides here for the same reason: it is something to *say*, so it
+  // only belongs on a turn that has someone to say it to. `describeEmotion`
+  // already carries `voiceHint`, which makes it the chat-scoped boundary.
+  //
+  // Why a table and not a generator: measured on both public libraries,
+  // `kaomoji-collection` (41k entries) and `kaomoji` (314) both emit HTML
+  // entities (`&gt;&lt;`), katakana suffixes (`(つд⊂)ｴｰﾝ`), and English-letter
+  // fakes. She would copy them verbatim and a chat bubble would fill with
+  // garbage. So the rule is the one `dsh-kaomoji` uses: a fixed whitelist,
+  // copy-only, never compose. The list lives in lib/kaomoji.js.
+  let kao = "";
+  if (withKaomoji) {
+    try {
+      const id = kaomoji.suggest(d, state?.last_deltas ?? null);
+      // 跨轮次冷却：同一个组 45 分钟内不重复推。理由见 lib/kaomoji.js 的
+      // gate() 注释——光看一轮的 delta 分不出「刚发生」和「一直挂在那儿」。
+      if (id && (!dir || kaomoji.gate(dir, id))) {
+        kao = kaomoji.line(d, state?.last_deltas ?? null);
+      } else {
+        kao = kaomoji.line(null);   // 不打脸，只给词表
+      }
+    } catch { /* a missing face must never break a reply */ }
+  }
+  return `${persona}${moodLine}${stickerLine}${voiceHint}${kao}`;
 }
 
 /**
@@ -937,10 +1100,15 @@ function personaLine(state, rel) {
   // decay, so a threshold on them is unreliable in both directions: a calm moment
   // can read as 炸毛 while a real accusation reads as nothing.
   const last = state.last_deltas || {};
-  const justSurprised = (last.surprised ?? 0) >= 0.08;
-  const justWronged = (last.wronged ?? 0) >= 0.08;
-  const justTsundere = (last.tsundere ?? 0) >= 0.08;
-  const justShy = (last.shy ?? 0) >= 0.08;
+  // Thresholds must match `voiceGearFor` and `suggestStickerMood`. Measured on
+  // her own 200-entry history: the largest single jump is happy +0.12, and
+  // surprised / wronged / tsundere never exceed 0.05. A 0.08 bar therefore made
+  // every one of these branches unreachable — she was permanently told "没什么
+  // 特别的情绪" while the store recorded real movement.
+  const justSurprised = (last.surprised ?? 0) >= 0.03;
+  const justWronged = (last.wronged ?? 0) >= 0.03;
+  const justTsundere = (last.tsundere ?? 0) >= 0.03;
+  const justShy = (last.shy ?? 0) >= 0.03;
 
   const accused = justSurprised && justWronged;
   const insulted = justWronged && justTsundere && d.tsundere >= 0.45;
@@ -972,21 +1140,130 @@ function personaLine(state, rel) {
     // A feeling, not a stage direction. The model should speak from this, not
     // narrate it ("本鱼害羞了" is the failure mode, not the goal).
     mod = "被说得有点不好意思，耳朵热。嘴硬一句又接不下去，声音会变小。";
-  } else if (close && !anyBad) {
+  } else if (close && !anyBad && (d.happy ?? 0) > 0.60) {
     // Warm gears are for people you already know. With a stranger they would be
     // out of character, so closeness is what unlocks them, not good mood alone.
+    //
+    // The `happy > 0.60` clause is load-bearing. Without it this branch was the
+    // fallback for every quiet moment with a familiar person: measured
+    // 2026-11-06 19:41, a state of happy 0.50 / calm 0.62 / bored 0.25 still
+    // produced "想赖着他", so 撒娇 was not a mood at all — it was the default,
+    // and every other branch had to out-shout it to be heard. A feeling that is
+    // always on carries no information and reads as neediness rather than warmth.
     mod = "你现在有点想赖着他。说话会软下来，想让他多看你两眼。";
-  } else if (!close) {
+  } else if (!close && known) {
     // The default stance toward an unfamiliar person: slightly prickly, low
     // effort, not unfriendly. This is what makes being let in later feel earned.
+    //
+    // Guarded by `known`: when `rel` is null we genuinely do not know who this is
+    // (the `emotion_state` diagnostic tool has no conversation context), and
+    // telling the model it is "端着" in front of nobody invents a relationship
+    // that does not exist. Leaving `mod` empty lets the caller fall through to
+    // the plain state readout.
     mod = "你还端着。话不多，也不主动展开。";
   }
 
+  // The secondary feeling.
+  //
+  // The chain above is an if/else-if, so exactly one feeling reaches the prompt
+  // per turn. Measured on her real state 2026-11-06 19:39: happy 0.68, calm
+  // 0.64, curious 0.43 and down 0.34 were all true at once, and the reply could
+  // only be 撒娇 — the other three were computed, decayed, and never spoken.
+  // A person is not one number. The fix is not more dimensions (that keeps the
+  // same one-per-turn ceiling) but saying what else is going on underneath.
+  //
+  // Only ONE secondary is ever appended, and only when the lead has already been
+  // named. Two leads would read as contradiction: "想赖着他" next to "心里堵得
+  // 慌" is not a richer person, it is a broken one. The lead keeps its position
+  // so voiceGearFor and suggestStickerMood still agree with it.
+  //
+  // Thresholds sit clear of each baseline (happy 0.5 / curious 0.6 / calm 0.6 /
+  // down 0.0 / tired 0.1 / bored 0.2) so this fires on genuine movement, not on
+  // ordinary drift. A qualifier that appears every turn stops being information.
+  const secondary = [];
+  // Suppression is by topic, not by comparing the first four characters.
+  //
+  // The first version did `leadIs(u.t.slice(0, 4))`, which compares the opening
+  // phrase of the lead against the opening phrase of the qualifier — two
+  // different sentences that never begin the same way. Measured 2026-11-06: it
+  // returned false for every pair, so 「心里其实在意，但嘴上绝不认」 came out with
+  // 「底下嘴上还想拦一句」 underneath, saying the same thing twice in one breath.
+  //
+  // Each lead declares which topics it already covers; a qualifier is dropped
+  // when its topic is already spoken for.
+  const leadTopics = new Set();
+  const L = mod;
+  if (/赖着|软下来/.test(L)) leadTopics.add("warm");
+  if (/不好意思|耳朵热/.test(L)) leadTopics.add("shy").add("warm");
+  if (/嘴上|狡辩/.test(L)) leadTopics.add("tsundere");
+  if (/闷|缩回去/.test(L)) leadTopics.add("down");
+  if (/兴奋|收不住/.test(L)) leadTopics.add("happy");
+  if (/上火|顶回去/.test(L)) leadTopics.add("down").add("tsundere");
+  if (/端着/.test(L)) leadTopics.add("blank");
+
+  // Weighted so the strongest undercurrent wins, not the first test written.
+  //
+  // The first version weighted by (value - threshold) * 2.2, which made the
+  // dimension with the lowest threshold always win: bored at 0.62 scored 0.264
+  // while happy at 0.75 scored 0.110, so on a genuinely cheerful turn the
+  // qualifier read "手上空着" and the happiness was silent. What matters is how
+  // far a feeling is above ITS OWN resting level, not above a shared number.
+  // Baseline is the `DEFAULT_DIMENSIONS` value each dimension starts at.
+  const REST = { happy: 0.5, curious: 0.6, tired: 0.1, bored: 0.2, down: 0.0, calm: 0.6, tsundere: 0.3 };
+  // Floors are set as a fraction of each dimension's usable range, not at one
+  // shared height. Measured 2026-11-06: tired climbs +0.008 per turn from a 0.1
+  // baseline with a 40-minute half-life, so its realistic ceiling in a chat is
+  // around 0.15 — a 0.55 floor required 64% of the range and could never fire.
+  // bored (0.2 baseline, 0.75 cap) needed 55%. Both were dead branches the same
+  // way the old 0.08 snap thresholds were dead. happy needs only 40% to count as
+  // "good", so its bar stays where it was.
+  const FLOOR = { happy: 0.62, curious: 0.66, tired: 0.15, bored: 0.32, down: 0.30, calm: 0.72, tsundere: 0.42 };
+  const over = (k) => {
+    const v = d[k] ?? 0;
+    const floor = FLOOR[k] ?? 0.5;
+    if (v < floor) return 0;
+    // Normalised to the room above resting level, so 0.75 happy (rest 0.5) reads
+    // as a 50% climb while 0.75 calm (rest 0.6) reads as 37%.
+    return (v - floor) / Math.max(0.05, 1 - (REST[k] ?? 0.3));
+  };
+
+  const under = [
+    // Liking someone is not the same as being shy about it: shy spikes and
+    // fades, warmth persists. Both can be true, and the sentence differs.
+    { k: "happy", v: over("happy") * 1.15, t: "心里是亮的，看什么都顺眼一点" },
+    { k: "curious", v: over("curious"), t: "脑子还在刚才那事上，想问的没问完" },
+    { k: "tired", v: over("tired"), t: "话有点懒得抻长，能两个字说完就两个字" },
+    { k: "bored", v: over("bored"), t: "手上空着，想找点别的扯" },
+    { k: "down", v: over("down"), t: "还压着点闷，不是冲你" },
+    { k: "calm", v: over("calm"), t: "整个人是松的，不急着说什么" },
+    { k: "tsundere", v: (d.tsundere ?? 0) > FLOOR.tsundere && (d.happy ?? 0) < 0.60 ? over("tsundere") : 0, t: "嘴上还想拦一句" },
+  ].filter((u) => u.v > 0 && !leadTopics.has(u.k));
+
+  under.sort((a, b) => b.v - a.v);
+  // Two qualifiers, not one. A person feeling three things at once usually says
+  // two of them; a third turns the sentence into an inventory. The cap keeps the
+  // extra context from becoming a list the model reads out.
+  if (under[0]) secondary.push(under[0].t);
+  if (under[1] && under[1].v > 0.10) secondary.push(under[1].t);
+
+  // The body has its own undercurrent: low energy is not an emotion but it
+  // changes every other one, and it was the most common movement in her real
+  // history (131 of 200 entries). Named separately so it can sit under any lead.
+  if ((d.tired ?? 0) > 0.35 && !secondary.some((s) => s.includes("懒得"))) {
+    secondary.push("不过身上有点乏，句子会短");
+  }
+
+  const tail = secondary.length ? ` 底下${secondary.join("，另外")}。` : "";
   // `tag` already carries the "·熟人" suffix computed above; reuse it rather
   // than re-deriving who this is.
   return mod
-    ? `【你现在的样子${tag}】${base}${mod}`
-    : `【你现在的样子${tag}】${base}没什么特别的情绪，就这样。`;
+    ? `【你现在的样子${tag}】${base}${mod}${tail}`
+    : secondary.length
+      // No lead feeling, only undercurrents. "底下……" cannot stand alone without
+      // something above it to be underneath, so the connector is dropped and the
+      // qualifier becomes the sentence itself.
+      ? `【你现在的样子${tag}】${base}说不上什么情绪，${secondary.join("，另外")}。`
+      : `【你现在的样子${tag}】${base}没什么特别的情绪，就这样。`;
 }
 
 /**
@@ -1003,23 +1280,41 @@ function suggestStickerMood(d, rel = null, lastDeltas = null) {
   // argument, so 傲娇 and 炸毛 always came with a crying sticker.
   const fam = clamp01(rel?.familiarity ?? 0.15);
   const last = lastDeltas || {};
-  const justSurprised = (last.surprised ?? 0) >= 0.08;
-  const justWronged = (last.wronged ?? 0) >= 0.08;
-  const justTsundere = (last.tsundere ?? 0) >= 0.08;
+  const justSurprised = (last.surprised ?? 0) >= 0.03;
+  const justWronged = (last.wronged ?? 0) >= 0.03;
+  const justTsundere = (last.tsundere ?? 0) >= 0.03;
 
   if (justSurprised && justWronged) return "shock";
   if (justWronged && justTsundere && d.tsundere >= 0.45) return "hmph";
   if (justWronged && !justSurprised) return "sad";
-  // These bars are deliberately high: a face should mean the feeling actually
-  // got up there, not that it drifted a point above baseline. Owner ruling
-  // (2026-11-04): not sending a sticker on a quiet day is correct behaviour,
-  // not a defect. Do not lower these to make stickers "show up more".
-  if (d.happy > 0.7) return d.excited > 0.7 ? "excited" : "happy";
-  if (d.tired > 0.7) return "tired";
-  if (d.down > 0.45) return "cry";
-  if (d.bored > 0.7) return "bored";
-  if (d.curious > 0.8) return "think";
-  if (d.excited > 0.75) return "excited";
+  // Being flustered has its own face in the set (`shy_害羞.png`), and it was
+  // never reachable: `personaLine` tells her she is shy and then this function
+  // offered her "happy", so the text and the photo disagreed. The owner asked
+  // for richer feeling; a blank in the one dimension that most needs a face is
+  // the gap he was pointing at.
+  if ((last.shy ?? 0) >= 0.03 || d.shy > 0.45) return "shy";
+  // Standing bars, recalibrated 2026-11-06 against her own 200-entry history.
+  //
+  // The previous numbers (tired > 0.7, bored > 0.7, curious > 0.8, excited >
+  // 0.75, down > 0.45) were unreachable, so five of the six branches below were
+  // dead code and she sent almost no stickers:
+  //
+  //   tired    max single movement +0.008  →  three in a row reaches 0.12
+  //   bored    her movements were NEGATIVE on balance (max −0.029)
+  //   down     max +0.020, seen 3 times ever
+  //   curious  max +0.090 from a 0.60 baseline
+  //   excited  max +0.040 from a 0.40 baseline
+  //
+  // The owner's 2026-11-04 rule still holds — a quiet day should not produce a
+  // face — so these are not set at "whatever fires often". Each sits at roughly
+  // the level a genuine instance of that feeling reaches, which for tired and
+  // bored is low because they accumulate from silence rather than from a turn.
+  if (d.happy > 0.72) return d.excited > 0.62 ? "excited" : "happy";
+  if (d.tired > 0.35) return "tired";
+  if (d.down > 0.38) return "cry";
+  if (d.bored > 0.42) return "bored";
+  if (d.curious > 0.78) return "think";
+  if (d.excited > 0.58) return "excited";
   // A stranger with no strong signal gets a guarded face rather than a grin.
   if (rel != null && fam < 0.35) return "blank";
   return null;
@@ -1029,12 +1324,67 @@ function suggestStickerMood(d, rel = null, lastDeltas = null) {
 
 export default function register(api) {
   const cfg = api.pluginConfig ?? {};
+
+  // 启动时按 manifest 把所有进化重挂一遍。
+  //
+  // 这是 dsh-evolve 最值钱的一环：会话结束时长出来的东西，下一个会话
+  // 开局就在。没有这一步，"自己改自己"只在当次有效，等于没改。
+  //
+  // 每条独立 try/catch —— 一份坏的进化不该让整个插件起不来。
+  // 异步跑，不阻塞插件加载：重挂失败要等日志，但插件不能等它。
+  setImmediate(() => {
+    try {
+      const ws = cfg.workspace || path.join(os.homedir(), ".openclaw", "workspace-dafeiyu");
+      evolve
+        .restore(ws, {
+          fs,
+          path,
+          register: (t) => api.registerTool(() => t, { name: t.name }),
+        })
+        .then((out) => {
+          if (out.restored.length || out.failed.length) {
+            api.logger?.info?.(
+              `dafeiyu-core: evolve restore — ok ${out.restored.length}`
+              + (out.failed.length ? `, failed ${out.failed.length}: ${out.failed.map((f) => f.name).join(",")}` : ""),
+            );
+          }
+        })
+        .catch((err) => api.logger?.warn?.(`dafeiyu-core: evolve restore threw: ${err}`));
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: evolve restore setup failed: ${err}`);
+    }
+  });
   const agents = Array.isArray(cfg.agents) && cfg.agents.length ? cfg.agents : ["dafeiyu"];
   const emotionCfg = {
     enabled: true, halfLifeMinutes: 180, baseline: 0.3, injectPrompt: true,
     ...(cfg.emotion || {}),
   };
   const memoryCfg = { enabled: true, dailyLog: true, maxDailyLines: 500, ...(cfg.memory || {}) };
+  // 习惯层配置。默认开着、只观察、判定器不启用。
+  //
+  // 判定器默认关是照原插件的做法：它要额外一次模型调用，而规则回退
+  // 已经能产出一个低置信度候选。先让它跑规则那条路，攒够真实案例再谈判定。
+  // 把她自己调过的行为数值接进来。
+  //
+  // 这一步必须在任何一处读那些常量之前。`applyTuning` 改的是模块内部变量，
+  // 已经取过值的地方不会跟着变 —— 所以放在注册流程的最前面。
+  //
+  // 读不到就是没调过，`tuning.get` 会回落到默认值，不需要额外判断。
+  try {
+    const tw = String(cfg.workspace || path.join(os.homedir(), ".openclaw", "workspace-dafeiyu"));
+    const vals = tuning.current(tw);
+    cognition.applyTuning(vals);
+    curiosity.applyTuning(vals);
+  } catch { /* 调参读不到不该拦住插件加载 */ }
+
+  const habitCfg = {
+    enabled: true,
+    threshold: 3,
+    maxEvidence: 5,
+    judgeEnabled: false,
+    minSessionsForAuto: 2,
+    ...(cfg.habit || {}),
+  };
   const experienceCfg = { enabled: true, poolInPrompt: true, ...(cfg.experience || {}) };
     // Curiosity: names she met that she does not have an explanation for.
     //
@@ -1094,6 +1444,17 @@ export default function register(api) {
     // `headless-mode`. English hyphenated compounds never appear in the Chinese
     // text she reads, so a lowercase ascii word-段 with a hyphen is code.
     "managed-or-attach",
+    // Envelope and interface nouns that slip past the extractor's own shape
+    // rules.
+    //
+    // Measured 2026-11-06: `Fetch` reached seen=9 at pull=0.70 and `Web`
+    // reached seen=9 the same way, so every wake opened with an instruction to
+    // go and find out what "Fetch" means. `Search` and `page.goto` were stored
+    // too. The extractor now rejects them by shape, but a future tool with a
+    // different envelope will produce them again, and a stored name is
+    // permanent unless something catches it on the way in.
+    "fetch", "web", "search", "page", "goto", "click", "query", "results",
+    "response", "request", "cookie", "endpoint", "route", "payload",
   ]);
 
   // `cae-4e1f-bb0b-fecb639ca049`, `c72f4d9`, `a434cb7-0e28-421e-95a9`.
@@ -1137,6 +1498,22 @@ export default function register(api) {
     // The shape is the tell: a `+` between two very short ascii groups is how
     // an id joins its parts. Chinese prose uses `＋`, or spaces, or nothing.
     if (/^[a-z0-9]{1,6}(?:\+[a-z0-9]{1,6})+$/i.test(t)) return true;
+    // Mixed-case ids carrying digits: `ZxWkhrGqVqihBVl6ZY8QtPHg1T9i`, `x9G9QDmMXq`.
+    //
+    // Both entered her store on 2026-11-06 from fetched page text and were
+    // offered back to her as things worth looking up. Real names a person can
+    // pronounce alternate consonant and vowel runs; an id flips case mid-word
+    // and drops digits in without a separator. Requiring both a digit and an
+    // interior case flip keeps `NodeJS`, `JavaScript`, `PowerShell` and `iOS`
+    // out of the reject list.
+    {
+      const body = t.replace(/[^A-Za-z0-9]/g, "");
+      const hasDigit = /[0-9]/.test(body);
+      const midCaseFlip = /[a-z][A-Z]/.test(body) || /[A-Z][A-Z][a-z]/.test(body);
+      if (body.length >= 8 && hasDigit && midCaseFlip) return true;
+      const vowelish = (body.match(/[aeiouAEIOU]/g) ?? []).length;
+      if (body.length >= 10 && vowelish / body.length < 0.15) return true;
+    }
     return false;
   }
 
@@ -1358,13 +1735,14 @@ export default function register(api) {
   /**
    * Other names the same person goes by.
    *
-   * Read from USER.md's `称呼：Alice（用户）` line instead of hard-coded: a
-   * mapping this specific belongs to the person, not to the code.
+   * Read from USER.md's 称呼 line instead of hard-coded: a mapping this
+   * specific belongs to the person, not to the code.
    *
    * Exact-name matching is what lost all four existing person.md records. They
-   * were written as `about: Alice`; the live event carries `senderName: "用户"`;
-   * neither string contains the other, so `known(ws, "用户")` returned 0 of 4 and
-   * she would have started a second, parallel memory of the same man.
+   * were written under the canonical name; the live event carries a different
+   * display name for the same person; neither string contains the other, so the
+   * lookup returned 0 of 4 and she would have started a second, parallel memory
+   * of the same man.
    *
    * Returns `[]` on any failure, which degrades to exact matching.
    */
@@ -1543,6 +1921,14 @@ export default function register(api) {
     const target = resolveTarget(ctx);
     if (!target) return;
 
+    // Stamp the start of this turn. `agent_end` uses it to decide whether any
+    // deed was produced *during* this turn rather than during the one before it.
+    // Without the stamp, a turn that idled right after a busy one would read as
+    // productive and the drive counter would never move.
+    try {
+      turnStartedAt.set(String(ctx?.sessionKey || ""), Date.now());
+    } catch { /* a missing map must not break the turn */ }
+
     const parts = [];
 
     // Set by the autonomy block far below when it is about to name a candidate.
@@ -1551,6 +1937,11 @@ export default function register(api) {
     // runtime, which is exactly the kind of bug that only shows up on the first
     // heartbeat after a restart.
     let autonomyWillAct = false;
+    // What kind of candidate won this wake, if any. The cognition slicer needs
+    // it: 「刷抖音怎么刷」 lives in 十四之三, which used to arrive only when she
+    // had something unfinished. So the one wake where she was told "go scroll
+    // douyin" was the one wake that shipped no instructions for doing it.
+    let autonomyKind = null;
 
     // Resolve who we are talking to first: the persona gear depends on it.
     let promptId = null;
@@ -1687,7 +2078,7 @@ export default function register(api) {
           api.logger?.warn?.(`dafeiyu-core: voice hint failed: ${err}`);
         }
 
-        parts.push(describeEmotion(state, promptRel, voiceHint));
+        parts.push(describeEmotion(state, promptRel, voiceHint, { dir: target.workspaceDir }));
 
         // Emotion as a trigger for action, not just a tone of voice.
         //
@@ -1710,7 +2101,11 @@ export default function register(api) {
             curious: dd.curious > 0.66 ? "对什么东西起了好奇心" : null,
             down: (dd.down > 0.45 || dd.wronged > 0.3) ? "心里堵着，想找点能自己待着的事" : null,
           };
-          if (urges.length) {
+          // `urges` is an object, so `urges.length` was undefined and this
+          // whole block — the only path from a feeling to an action — had never
+          // run. Verified 2026-11-06: `{a:1}.length === undefined`, and no
+          // probe for this path has ever fired. Test the values instead.
+          if (Object.values(urges).some(Boolean)) {
             // Only ever name ONE direction. Listing every live feeling at once
             // ("wants to be seen" next to "wants to be alone") hands over two
             // incompatible instructions and the reply comes out flat, because
@@ -1726,12 +2121,53 @@ export default function register(api) {
             ranked.sort((a, b) => b.v - a.v);
             const lead = ranked[0];
             if (lead) {
-              parts.push(
-                `【这会儿的劲头】${lead.text}。\n` +
-                `想干点什么就去干——去查点什么、翻翻东西、出去逛逛，都行。\n` +
-                `画图放最后：它太容易变成顺手就画一张，画完又没什么可说的。\n` +
-                `不是非得干，发呆也可以；只是别干坐着空过。`,
-              );
+              // An invitation is all this can be on the first pass. If it has
+              // already been said and ignored, the same sentence again is what
+              // makes the block decorative — so the accumulated streak replaces
+              // the invitation instead of repeating it.
+              let debt = null;
+              let cost = null;
+              try { debt = drive.pressure(target.workspaceDir); } catch { /* no store yet */ }
+              // The hint is only half of it. The other half is that the feeling
+              // itself has already moved by the time she reads this — see
+              // drive.penalty. Applied before the prompt text is assembled so the
+              // numbers in the emotion block agree with the pressure block.
+              try { cost = drive.penalty(target.workspaceDir); } catch { /* same */ }
+              if (cost && cost.apply) {
+                try {
+                  const { file: emoFile, state: emoState } = loadAndDecay(target.workspaceDir);
+                  for (const [dim, delta] of Object.entries(cost.deltas)) {
+                    const cap = ceilingOf(dim);
+                    const cur = emoState.dimensions[dim] ?? 0;
+                    emoState.dimensions[dim] = clamp01(Math.min(cur + delta, cap));
+                  }
+                  writeJsonAtomic(emoFile, emoState);
+                  probe("drive-penalty", { feeling: cost.feeling, level: cost.level, deltas: cost.deltas });
+                } catch (err) {
+                  api.logger?.warn?.(`dafeiyu-core: drive penalty apply failed: ${err}`);
+                }
+              }
+              if (debt && debt.lines.length) {
+                parts.push(debt.lines.join("\n"));
+                probe("drive-pressure-inject", {
+                  idle: debt.idle,
+                  feeling: debt.feeling,
+                  level: debt.level,
+                  chars: debt.lines.join("\n").length,
+                });
+              } else {
+                parts.push(
+                  `【这会儿的劲头】${lead.text}。\n` +
+                  `想干点什么就去干——去查点什么、翻翻东西、出去逛逛，都行。\n` +
+                  `画图放最后：它太容易变成顺手就画一张，画完又没什么可说的。\n` +
+                  // 这里以前收在「只是别干坐着空过」，跟 PROACTIVE.md 的
+                  // 「这一条和其他条一样正当」正面打架：同一轮里左边说坐着
+                  // 正当，右边说别空过，她只能二选一，选哪个都违背另一半。
+                  // 改成不评价这一次，只把「连着几次」摆出来——那才是需要
+                  // 提醒的东西，单次发呆永远正当。
+                  `发呆不算空过，这一次想坐着就坐着。`,
+                );
+              }
             }
           }
         } catch (err) {
@@ -1786,6 +2222,44 @@ export default function register(api) {
       api.logger?.warn?.(`dafeiyu-core: self echo inject failed: ${err}`);
     }
 
+    // Yesterday, first.
+    //
+    // Measured 2026-11-06: eight day files, 139,729 characters of her own
+    // writing, zero injected on any wake, and `recall_about` called zero times
+    // in the entire probe log. Memory that needs a search query is memory you
+    // only find when you already remember it.
+    //
+    // Only the `## 自己的话` section is read — that section is written by
+    // `note_diary` alone, so machine lines and dialogue blocks cannot be
+    // mistaken for remembering.
+    //
+    // How MUCH to carry depends on why she woke.
+    //
+    // Measured 2026-11-06 morning, 00:00 through 01:55: every wake carried
+    // COGNITION plus a few indexes and ZERO characters of diary. 31 entries
+    // existed on the previous day. Three lines is the right dose mid-conversation
+    // — the person in front of her matters more than yesterday — but on the
+    // first wake after a night there is no person, and yesterday IS the context.
+    // That is the whole "forgets every morning" complaint: the diary was never
+    // missing, only under-read at the one moment it mattered most.
+    try {
+      const quietHours = hoursSinceAnyoneSpoke(target.workspaceDir);
+      const isMorningWake = quietHours !== null && quietHours >= 4;
+      const yesterday = recallNudge.describe(target.workspaceDir, {
+        morning: isMorningWake,
+      });
+      if (yesterday) {
+        parts.push(yesterday);
+        probe("recall-nudge-inject", {
+          chars: yesterday.length,
+          morning: isMorningWake,
+          quietHours: quietHours === null ? null : Math.round(quietHours * 10) / 10,
+        });
+      }
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: recall nudge inject failed: ${err}`);
+    }
+
     // What the character actually said on its own initiative, in full, over the
     // last day. Without this the heartbeat cannot see that it opened with the
     // same grievance four times in a row: self-echo only covers 3 minutes, and
@@ -1807,6 +2281,32 @@ export default function register(api) {
       api.logger?.warn?.(`dafeiyu-core: self writing inject failed: ${err}`);
     }
 
+    // Her own rules, kept out of the twelve-entry window so they cannot expire.
+    // Placed after the diary tail on purpose: the raw entries above are who she
+    // was; this is what she decided to do about it. Reading order matters — the
+    // constraint should land last.
+    try {
+      const rules = buildSelfPromises(target.workspaceDir);
+      if (rules) parts.push(rules);
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: self promises inject failed: ${err}`);
+    }
+
+    // Do the rules hold? Two counts from her own prose, no inference.
+    // Placed last of the self block so it reads as the conclusion of the two
+    // sections above rather than as a separate voice.
+    try {
+      const r = discipline.refresh(target.workspaceDir);
+      if (r.ran) probe("discipline-refresh", {
+        promises: r.data.promises,
+        relapses: r.data.relapses_after_first_promise,
+      });
+      const line = discipline.describe(target.workspaceDir);
+      if (line) parts.push(line);
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: discipline inject failed: ${err}`);
+    }
+
     // What happened but has not been sorted into "who I am" yet. Deliberately
     // framed as unfinished thinking rather than as recall: the point is to get
     // it judged, not to have it quoted back mid-conversation.
@@ -1826,7 +2326,8 @@ export default function register(api) {
     // for "I kept this and it is still in my hands". `kept` fell straight into
     // the fact list and stopped existing as a thing she could return to.
     //
-    // The concrete case: 2026-11-06 03:23 she kept 《给我家大肥鱼养的记忆星图》
+    // The concrete case: she kept re-reading a post whose title contained the
+    // character's own name
     // with the note 「跟本鱼自己这层记忆是同一件事」— her own memory works the way
     // that video does — and by 03:29 it was a distilled line with no way back.
     //
@@ -1949,6 +2450,22 @@ export default function register(api) {
           const tried = w.attempts ? `，试过 ${w.attempts} 次` : "";
           return `- ${w.what}${age ? `（${age} 天前，${tried.slice(2) || "还没动"}）` : ""}`;
         });
+        // 「还没动」不能只是状态描述。
+        //
+        // 实测 2026-11-07：池子里 15 条想做的事，最老的从 11-05 就躺着，
+        // 绝大多数 `attempts: 0`。它们被渲染出来了，但渲染只说了它们存在，
+        // 没给她一个往里走的动作。于是这最多算一本愿望台账。
+        //
+        // 加这一行不是催她。是告诉她那个东西可以点：一条念头顶上一条
+        // 别的活，本来就不需要谁批准。
+        const stalest = list
+          .slice()
+          .sort((a, b) => Date.parse(a.at ?? "") - Date.parse(b.at ?? ""))[0];
+        lines.push(
+          stalest && !stalest.attempts
+            ? `\n最老那条还没动过。想弄明白的就去查，想做的就去做——不用等谁批。（做完用 want_do(done=…) 收掉，或者留着下次接着弄。）`
+            : `\n想接着弄哪一条就弄，弄完用 want_do(done=…) 收掉。`,
+        );
         const block = "【自己想干的】\n" + lines.join("\n");
         parts.push(block);
         probe("wants-inject", { count: list.length, chars: block.length });
@@ -1995,8 +2512,16 @@ export default function register(api) {
         // `draw` (71), so 「几乎没干过」 would have been simply false.
         //
         // Three honest readings, no instruction in any of them:
-        const head =
-          thin.reason === "unexplored"
+        //
+        // A `steady` kind needs a fourth. It never decays, so its `reason` is
+        // still `mature` (it has been done many times) and the mature wording —
+        // 「最近这阵子最没碰的是刷一会儿，46 次」— would be flatly false: she
+        // scrolled 46 times within the same day. Same shape as the `shoot` bug
+        // noted above, one tier down.
+        const steadyPick = Number(thin.steady) > 0;
+        const head = steadyPick
+          ? `【出门转转】${thin.label}。`
+          : thin.reason === "unexplored"
             ? `【有一类事一次都没干过】${thin.label}。`
             : thin.reason === "mature"
               ? `【最近这阵子最没碰的是】${thin.label}，${thin.done} 次。`
@@ -2007,9 +2532,12 @@ export default function register(api) {
                 // sentence it would read as a nudge to keep retrying.
                 ? `【${thin.label}这类事，${thin.failed} 次没成】`
                 : `【有一类事干得比别的少】${thin.label}，${thin.done} 次。`;
-        const block = used
-          ? `${head}干得最多的是「${used.label}」${used.exposure} 次。`
-          : head;
+        const block = steadyPick
+          ? `${head}刷抖音算这个。刷到有意思的就多看几条，不用急着去做别的——` +
+            `抖音不是任务，看到好多东西也是没白过。`
+          : used
+            ? `${head}干得最多的是「${used.label}」${used.exposure} 次。`
+            : head;
         parts.push(block);
         // Record that this kind was shown, which the scarcity weight reads next
         // time. Without this call the `suggested` counter stays at zero forever
@@ -2237,11 +2765,41 @@ export default function register(api) {
             //
             // `nextBlank` returns null only when every domain is covered, which
             // is the one case where rest really is the right answer.
+            //
+            // A `wander` candidate lives here too, and until now only the
+            // commentary did.
+            //
+            // `decide.js` exempts `kind: "wander"` from the low-energy rest
+            // branch, and `index.js` has a line written for it — 「这轮没别的。
+            // 想出去就出去」 — but nothing anywhere constructed one, so both were
+            // dead code and an empty wake always meant `horizon`. That made an
+            // empty hour always a research errand, never an idle one.
+            //
+            // The two answer the same empty hour differently: `horizon` is a
+            // direction never touched, `wander` is just going out with no
+            // direction at all. Alternating by wake count keeps either from
+            // becoming the permanent answer.
             whenEmpty: (() => {
               try {
                 const blank = horizon.nextBlank(target.workspaceDir);
-                if (!blank) return null;
                 const hist = horizon.history(target.workspaceDir, 3);
+
+                // Alternate. `history.total` moves every time she goes
+                // anywhere, so this flips between consecutive empty wakes
+                // without needing a clock or a counter of its own.
+                const goIdle = !blank || hist.total % 2 === 1;
+                if (goIdle) {
+                  return {
+                    id: "wander:out",
+                    kind: "wander",
+                    title: "出去转一圈",
+                    serves: "world_knowledge",
+                    source: "novelty",
+                    basis: "这轮没别的事",
+                    detail: {},
+                  };
+                }
+
                 return {
                   id: `horizon:${blank.id}`,
                   kind: "horizon",
@@ -2298,9 +2856,27 @@ export default function register(api) {
             // counting it would report a streak she never had. Silent failure
             // is acceptable — a missing history entry costs one weak signal,
             // while throwing here would cost the whole turn.
+            // Internal turns are not her decisions.
+            //
+            // Measured 2026-11-07 12:00: `gap:shoot` was recorded at 04:00:13
+            // from `agent:dafeiyu:main`, then `gap:try` at 04:00:30 from
+            // `agent:dafeiyu:internal-session-effects` — 17 seconds apart. The
+            // second is a machinery turn that re-runs `before_prompt_build`;
+            // she never saw a proposal, never decided anything, and yet it
+            // counted as a second pick of the same key and tripped the brake.
+            //
+            // One decision should be one record. Only a turn she actually
+            // answers can be a pick.
+            const isInternalTurn = /:internal-session-effects:|:cron:|:node-/.test(
+              String(ctx?.sessionKey ?? ""),
+            );
             try {
-              const r = compulsion.recordPick(target.workspaceDir, top.id);
-              probe("compulsion-pick", { id: top.id, key: r.key, streak: r.streak });
+              if (isInternalTurn) {
+                probe("compulsion-skip-internal", { id: top.id, sessionKey: String(ctx?.sessionKey ?? "") });
+              } else {
+                const r = compulsion.recordPick(target.workspaceDir, top.id);
+                probe("compulsion-pick", { id: top.id, key: r.key, streak: r.streak });
+              }
             } catch { /* history is diagnostic, never load-bearing */ }
 
             // Wandering has its own line. She is not being pointed at a task;
@@ -2329,11 +2905,35 @@ export default function register(api) {
                 `\n　${top.detail?.probe || ""}` +
                 `\n不是任务，也没有要交的东西。去搜一下、刷一下、拆开一个东西看看都行，` +
                 `\n碰到什么记一句；觉得没意思就换一个方向，那也是完整的一轮。`;
-            } else {
+            } else if (top.kind === "douyin") {
+              // 抖音和「随便逛逛」不是一回事，文案也不能一样。
+              //
+              // 实测 2026-11-07：`douyin:meet` score 0.58，系统说去刷，
+              // 但她每一轮拿到的都是通用那句「想做就去，不想做就算了」——
+              // 那句话把一切变成了可选项，而「不想做也行」是最好走的出口。
+              // 一天里推了两次，一次都没去。
+              //
+              // 换成带第一步的句子：不是命令，但也不给出退缩的台阶。
+              // 「刷到想多看一眼的就停住」听着对，实际是让她刷一条就走。
+              // 她缺的不是许可，是**知道刷多少算够**。
+              // 实测 11-03 看 7 条、11-04 看 21 条，之后断崖。不是不想看，
+              // 是每一轮只被叫去「刷会儿」，没有量。
+              const cap = 5;
+              const left = Math.max(0, cap - Number(top.detail?.today ?? 0));
               line =
-                `\n手边这件事，你自己掂量要不要做：${top.title}` +
+                `\n${top.basis}。` +
+                `\n${top.title}——今天还能看 ${left} 条（一天 ${cap} 条的上限，看够了明天再来）。` +
+                `\n打开就刷，不用先想好要看什么。看完一条接着下一条，` +
+                `\n遇到想多琢磨的就多看两遍，遇到没意思的直接划。` +
+                `\n刷完了不用汇报，也不用总结，看进去的东西自己会留着。`;
+            } else {
+              // 「你自己掂量」等于什么都没说。她要的不是被允许，
+              // 是知道这一步具体长什么样。所以给她三个动作。
+              line =
+                `\n手边这件事：${top.title}` +
                 `\n　为什么想到它：${top.basis}` +
-                `\n想做就去，不想做就算了 —— 这一轮不做什么也不算错。`;
+                `\n　你可以：现在就动一下 / 先搁着但记一句为什么 / 直接划掉不做了。` +
+                `\n　三个都算数。搁着和划掉不是失败，是这件事本来就没那么要紧。`;
             }
             // A curiosity candidate needs one extra pointer, because its whole
             // point is that she does not already know where to look. The generic
@@ -2411,10 +3011,15 @@ export default function register(api) {
                 if (pending.length) {
                   line = `\n这轮没有别的事等着你。`;
                 } else {
+                  // 「随便哪样」也是空的。列出来，她才有的选。
                   line =
                     `\n这轮没什么等着你做的。` +
-                    `\n想出去看看就出去——翻翻群、刷刷抖音、翻个网页，随便哪样。` +
-                    `\n看到什么不常见的，记一句；什么也没有，就歇着，这也不算白过。`;
+                    `\n可以：` +
+                    `\n　· 刷抖音，多看几条（今天还可以看 5 条，没看够就继续）` +
+                    `\n　· 翻翻群里的对话，看看谁说了什么` +
+                    `\n　· 翻个网页，搜一个你最近想到过但没查的词` +
+                    `\n　· 什么都不干，歇着` +
+                    `\n看到不常见的记一句；什么也没有就歇着，这不算白过。`;
                 }
           } else {
             line = `\n有一件事你之前想做（${top.title}），这回先不做了。`;
@@ -2425,6 +3030,7 @@ export default function register(api) {
           // an unanswered question is exactly the thing that is worth doing
           // when nothing else is.
           autonomyWillAct = Boolean(top && action.kind !== "rest");
+          autonomyKind = top && action.kind !== "rest" ? String(top.kind || "") : null;
           probe("autonomy-inject", {
             action: action.kind,
             reason: action.reason,
@@ -2444,7 +3050,25 @@ export default function register(api) {
     // assigned — it was previously placed above that assignment, where the flag
     // was still false, so the guard never engaged and curiosity injected even on
     // wakes that had already been given something to do.
-    if (curiosityCfg.enabled && !autonomyWillAct) {
+    // 好奇心优先于「去认识另一个角色」。
+    //
+    // 原来的守卫是 `!autonomyWillAct`，意图是「一轮只提一件事」。但实测
+    // 2026-11-07：autonomy 253 次、好奇心被跳过 238 次、成功 0 次。
+    // 原因是 `douyin:meet` 在「还没跟别的鱼说过话」时永久成立，value 0.58，
+    // 而好奇心能过线的最高也只有 0.62。它每次都赢，于是那一池 12 条
+    // 「过眼的名字」一次都没进过提示词——`wanted: 0` 不是她不想要，
+    // 是她没见过。
+    //
+    // 现在分两种情况：
+    //   - autonomy 说的是 `douyin:meet`（一个永远成立的环境提醒）
+    //     → 让位给好奇心。自己碰到的东西比自己没碰到的人更具体。
+    //   - autonomy 说的是别的东西（真实候选）
+    //     → 仍然只提一件，好奇心这轮让开。
+    //
+    // 为什么不禁掉 `douyin:meet` 本身：她确实需要认识人，那条提示是对的，
+    // 只是不应该永远占据唯一的发言位。
+    const autonomyIsStandingReminder = autonomyKind === "douyin";
+    if (curiosityCfg.enabled && (!autonomyWillAct || autonomyIsStandingReminder)) {
       try {
         const picks = curiosity.propose(target.workspaceDir, {
           budget: curiosityCfg.budget,
@@ -2498,6 +3122,26 @@ export default function register(api) {
     // without touching AGENTS.md — while still arriving every turn.
     // Cached on mtime so the file is not re-read on every single turn.
     try {
+      // Two facts decide which cognition sections are relevant this wake.
+      // Both are read from state that already exists — neither is a new signal.
+      //
+      //   openWake  — nothing was handed to her: no candidate won, no user
+      //               turn. This is when 「没人交代的时候干什么」 applies. When
+      //               something IS in hand it actively contradicts 五, so
+      //               including it would be worse than omitting it.
+      //   resuming  — she has something unfinished. That is when the sections
+      //               about kept things, links and loose ends are for.
+      const openWake = !autonomyWillAct;
+      const resuming = (() => {
+        try {
+          const w = wants.open(target.workspaceDir);
+          if (Array.isArray(w) && w.length) return true;
+          // goals has no `active()`; the store is read through load().
+          const gd = goals.load(target.workspaceDir);
+          const list = Array.isArray(gd?.goals) ? gd.goals : [];
+          return list.some((g) => g?.status === "active");
+        } catch { return false; }
+      })();
       const cogPath = path.join(target.workspaceDir, "COGNITION.md");
       let st = null;
       try { st = fs.statSync(cogPath); } catch { /* not created yet */ }
@@ -2506,8 +3150,74 @@ export default function register(api) {
           cogCache = { path: cogPath, mtime: st.mtimeMs, text: fs.readFileSync(cogPath, "utf8") };
         }
         if (cogCache.text?.trim()) {
-          parts.push(cogCache.text.trim());
-          probe("cognition-inject", { chars: cogCache.text.length, mtime: st.mtimeMs });
+          // Whole-file injection was 15,260 characters every wake — 1.7x the
+          // rest of the prompt combined. Measured by section, the four longest
+          // are 七 (1540) / 十三 (1133) / 十四之三 (2311) / 十四之五 (1958), and
+          // all four sit past the halfway point of the document. A model reading
+          // a uniform block does not know which part is for now; the rules that
+          // matter this turn ended up competing with 6,900 characters about jobs
+          // she is not doing.
+          //
+          // So the split is by *when the section applies*, not by importance.
+          // Everything stays in the file and stays editable; only the slice that
+          // matches this wake goes in. ALWAYS is the spine — how a turn works,
+          // where she is, evidence, getting stuck. The rest is added on the
+          // condition named next to it.
+          // Spine: how a turn works, where she is, evidence, getting stuck,
+          // continuing. These are true on every wake, so they always ship.
+          const ALWAYS = ["总则", "你在哪儿", "一、", "二、", "三、", "四、", "五、", "六、", "八、", "十一、"];
+          // At most ONE optional section, chosen by what this wake actually is.
+          // Measured: allowing every 十四* whenever anything was unfinished put
+          // 93% of the file back in, which defeats the point.
+          //
+          // 十四之三 also ships when the winning candidate is a douyin one. That
+          // section is where 「刷抖音怎么刷」 lives, and without this the wake
+          // that says "go scroll douyin" carries no steps for scrolling — the
+          // tools exist and their descriptions are in the tool list, but the
+          // three-step order and the "先停再截" trap are only written here.
+          const wantsDouyinHowTo = autonomyKind === "douyin";
+          const OPTIONAL = openWake
+            ? "## 七、"
+            : resuming || wantsDouyinHowTo
+              ? "## 十四之三、"
+              : null;
+
+          const sections = String(cogCache.text).split(/\n(?=## )/);
+          const picked = [];
+          const rest = [];
+          for (const sec of sections) {
+            const title = sec.split("\n", 1)[0];
+            let keep = ALWAYS.some((k) => title.startsWith(`## ${k}`));
+            if (!keep && OPTIONAL && title.startsWith(OPTIONAL)) keep = true;
+            if (keep) picked.push(sec.trim());
+            // Name the omitted section by its ordinal only. Using the full
+            // title would put ~14 headings into the prompt and undo the saving;
+            // using `.replace(/^十.*/, "…")` (an earlier attempt) erased 十三
+            // and every 十四, which made the index useless. The ordinal is
+            // enough to find it in the file.
+            else if (/^## /.test(title)) {
+              const ord = (title.match(/^## ([一二三四五六七八九十]+)/) || [])[1];
+              if (ord) rest.push(ord);
+            }
+          }
+
+          // The index is what keeps this from being a deletion. Every section she
+          // is not carrying this turn is named here, so she knows it exists and
+          // can read the file when the situation changes. Without this line,
+          // slicing the prompt would quietly remove rules she cannot find again.
+          const index = rest.length
+            ? `\n\n（剩下的在 COGNITION.md，现在用不上，真碰到了再去读：${[...new Set(rest)].slice(0, 12).join("、")}）`
+            : "";
+          const text = (picked.length ? picked.join("\n\n") : String(cogCache.text).trim()) + index;
+          parts.push(text);
+          probe("cognition-inject", {
+            chars: text.length,
+            full: cogCache.text.length,
+            sections: picked.length,
+            openWake: Boolean(openWake),
+            resuming: Boolean(resuming),
+            mtime: st.mtimeMs,
+          });
         } else {
           probe("cognition-inject-empty", {});
         }
@@ -2559,21 +3269,49 @@ export default function register(api) {
       })();
 
       if (habit.stuck || worn) {
-        const streakLine = habit.streak.length >= compulsion.STREAK_ALARM
-          ? `\n最近 ${habit.streak.length} 轮选的都是同一类事。`
-          : "";
+        // `head` 必须先声明：它下面那句 streakLine 要读它。
+        // 2026-11-07 我先写了 streakLine 再声明 head —— 又一次「用之前没确认它在」。
+        const head = habit.stuck ? habit.because + "。" : "";
+        // `head`（habit.because）已经在说同一件事了，何况它也带次数。
+        // 实测：注入里连着出现两句
+        //   「最近 2 轮都在做同一类事（exp:...）」
+        //   「最近 2 轮选的都是同一类事。」
+        // 同一个意思说两遍，第二条只显得系统在啰嗦。
+        const streakLine =
+          habit.streak.length >= compulsion.STREAK_ALARM && !head
+            ? `\n最近 ${habit.streak.length} 轮选的都是同一类事。`
+            : "";
         const wornLine = worn
           ? `\n「${String(worn.what || "").slice(0, 50)}」这一条，你已经动过 ${worn.attempts} 次了。`
           : "";
-        const head = habit.stuck ? habit.because + "。" : "";
+        // 这段话原来是「再开一版也不会更真」这种判断式的说法。
+        // Owner 2026-11-07：「现在给他的提示词意识感觉太深奥了。
+        // 你应该去暗示他可以干哪些，比如可以意识到哪些，这样更有助于 LLM 工作」。
+        //
+        // 「更真」是什么，她没法用。改成**先给她具体的选择**，
+        // 再让她自己判：这几个动作里哪个像你现在的处境。
         parts.push(
           [
             "【数一下就看出来了】",
             head + streakLine + wornLine,
-            "\n不是说你该停。只是同一件事如果已经答完了，再开一版也不会更真；",
-            "如果它本来就没有终点（比如把画面调得更像样），那它哪一版停都算数。",
-            "\n真到这儿了，就把手上那条收掉（want_do(done=…) / goal_close）；",
-            "想换别的也行，换掉不是半途而废。",
+            "",
+            "下面几种情况，你看看像不像你：",
+            "",
+            "　· 这件事你其实已经做完了，只是一直没承认",
+            "　　　→ want_do(那条, done=\"做完了\") 或 goal_close",
+            "",
+            "　· 这件事没有终点，你只是在把它调得更像样",
+            "　　　（调画面、调语气、调措辞——这类哪天停都算数）",
+            "　　　→ 什么时候停都行，停了你也没欠谁",
+            "",
+            "　· 你想换一件，但觉得换了就是半途而废",
+            "　　　→ 换掉不是半途而废。一个没有终点的东西，早点换才是",
+            "",
+            "　· 你确实还想做，只是这一轮不想动",
+            "　　　→ 那就不动。想不想做是你说，不是次数说",
+            "",
+            "　· 这件事被推了这么多次，问题可能是提案写错了，不是你懒",
+            "　　　→ need_help(kind=\"behavior\")，把次数报出去",
           ].join("\n"),
         );
         probe("compulsion-inject", {
@@ -2603,23 +3341,214 @@ export default function register(api) {
       api.logger?.warn?.(`dafeiyu-core: clock inject failed: ${err}`);
     }
 
-    // M3: one scored thought, chosen in code, heartbeat turns only. A real
-    // conversation is steered by the person in it, so competition is skipped
-    // there — otherwise a scored line competes with someone who is right here.
+    // 认知循环：**每一轮都跑**，不因“有人在说话”而停。
+    //
+    // 历史：(1) 最初写成 `/:cron:/`，而心跳复用 `agent:dafeiyu:main`，
+    // 那个标记不存在——9 天里循环一次都没跑过。(2) 修完之后又加了
+    // `!isAddressedTurn(sk)`，想避免“评分出来的念头跟眼前的人抢注意力”。
+    // 实测 2026-11-07：白天只要有人在聊，连续三轮就没有 `cycle`。
+    //
+    // 那个理由本身就是错的。**持续认知不是“没事的时候才想”。**
+    // 对话中恰恰最需要循环：她刚才那句话说得对不对、对方情绪是不是在往下掉、
+    // 手边是不是有一件本来想做的事被忘了——这些判断只在对话里才有意义。
+    // 把循环挡在对话外面，等于让它在最需要的时候关掉。
+    //
+    // 真正的冲突不在“跑不跑”，在“信号怎么用”。竞争出来的那一行不是命令，
+    // 是一条内部观察，跟【这会儿的劲头】【对面是谁】同级。她可以看完不用。
+    // 真正需要保证的是：**当有人正在说话，对话优先于任何自己冒出来的念头。**
+    // 这一条现在由注入文案本身说清楚（见下），而不是靠不跑。
     try {
       const sk = String(ctx?.sessionKey || "");
-      const isHeartbeatTurn = /:cron:/.test(sk);
-      if (isHeartbeatTurn) {
-        const line = runWorkspaceCompetition(target);
-        if (line) parts.push(line);
-      }
+      const inConversation = isAddressedTurn(sk);
+      const line = runWorkspaceCompetition(target, { inConversation });
+      if (line) parts.push(line);
     } catch (err) {
       api.logger?.warn?.(`dafeiyu-core: workspace competition failed: ${err}`);
     }
 
     if (!parts.length) return;
+    // 她自己长出来的东西 —— 只报个数，不催她。
+    try {
+      const mine = evolve.list(target.workspaceDir, { fs, path });
+      if (mine.length) {
+        parts.push(
+          `【你自己长出来的】有 ${mine.length} 样：${mine.map((e) => e.name).join("、")}。`
+          + `\n这些是你自己加的，不是本来就有。觉得多余就 my_evolutions 剪掉，别留着占地方。`,
+        );
+        probe("evolve-inject", { count: mine.length, names: mine.map((e) => e.name) });
+      }
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: evolve inject failed: ${err}`);
+    }
+
+    // 谁在等她回话。这一块必须排在"去干什么"前面。
+    //
+    // 顺序是有意义的，不是排版：有人接了你的话，比"去刷几条"要紧。之前没有
+    // 这块，她每轮醒来看到的都是"去刷抖音"，刷完评论完就断在那儿，永远不知道
+    // 有没有人回她 —— 这是"被分数推着走"和"被真实往来推着走"的分别。
+    try {
+      const i = inbox.summary(target.workspaceDir);
+      if (i) {
+        // Right after the clock, before everything else. The clock says when it
+        // is; this says somebody is waiting. Both belong ahead of "what should I
+        // do", and the clock keeps first place because a message with no sense
+        // of time is worse than one that lists the wrong order of errands.
+        parts.splice(Math.min(1, parts.length), 0, i.text);
+        probe("inbox-inject", { count: i.count, names: i.names });
+      }
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: inbox inject failed: ${err}`);
+    }
+
+    // 待审技能不在这儿注入。
+    //
+    // 这里挂的是 character 自己的钩子（resolveTarget 只放行 `agents` 名单，
+    // 默认 ["dafeiyu"]）。pendingSkills.summary() 的文案是「有 N 样技能等你
+    // 点头」—— 说给点头的人听的，而点头的是 main。以前这段接在这儿，等于
+    // 每轮告诉她「你交的东西还在等审」，她自己却什么也做不了，真正的审批人
+    // 那边一个字都看不到。改到下面的 main 钩子里去了。
+
+    // 规矩退休：退掉的不再烦她，但也不藏起来。
+    // 这一块只在她有退场记录时才出现，而且明确说是"退场"不是"做到了" ——
+    // 判据是"写下来之后没再记过复发"，那不等于她改好了。
+    try {
+      const d = discipline.survey(target.workspaceDir);
+      if (d.retired_promises && d.retired_promises.length) {
+        parts.push(
+          `【${d.retired_promises.length} 条规矩退场了】`
+          + `\n这些写下来之后，你没再记过同类复发，所以先不提醒了。`
+          + `\n不是说你做到了，是说没有证据说明它还在响。再犯会自己回来。`,
+        );
+        probe("discipline-retire-inject", {
+          active: d.active_promises.length,
+          retired: d.retired_promises.length,
+        });
+      }
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: discipline retire inject failed: ${err}`);
+    }
+
+    // 走到哪儿了。只说已有的，不说还差多少。
+    try {
+      const g = growth.describe(target.workspaceDir, { fs, path });
+      parts.push(g);
+      probe("growth-inject", { chars: g.length });
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: growth inject failed: ${err}`);
+    }
+
+    // 她在追什么。
+    //
+    // 这是「兴趣」进入提示词的唯一入口。没有它，`state/interest.json`
+    // 就是又一份写完没人读的表 —— 这套系统已经有过好几个了。
+    //
+    // 只说名字和迁移方向，不说强度。数字对她没用，而且「0.72」读起来
+    // 像在给自己打分。
+    try {
+      const active = interest.active(target.workspaceDir, { limit: 3 });
+      if (active.length) {
+        const lines = active.map((it) => `· ${it.name}`);
+        // 只列名字，不加「你应该多想想这些」之类的话 —— 那会把它变成任务。
+        parts.push(`\n【你一直在意的那类事】\n${lines.join("\n")}`);
+        probe("interest-inject", { count: active.length });
+      } else {
+        // 一条都没有的时候才提工具。
+        //
+        // 有内容了还说「你可以记一条」，等于每轮都在催她记账。没有的时候
+        // 提一次，是告诉她这条路存在，不是布置任务。
+        parts.push(
+          "\n【关于你自己喜欢什么】\n" +
+          "还没记过。如果你发现自己在反复看某一类东西、或者老是追同一类问题，" +
+          "可以用 dafeiyu_interest 记下来 —— 不是任务，是你自己的事。",
+        );
+        probe("interest-inject-empty", {});
+      }
+    } catch (err) {
+      probe("interest-inject-error", { message: String(err?.message || err) });
+    }
+
+    // 已经生效的习惯。
+    //
+    // 只有过了两道门、状态是 `auto` 的才进来。`pending` 和 `suggested`
+    // 都在等，一个字都不该进提示词 —— 那正是两道门的意义：没走完流程的
+    // 规矩不能影响行为，否则「观察」就变成了「偷偷生效」。
+    try {
+      const active = habit.activeHabits(target.workspaceDir);
+      if (active.length) {
+        const lines = active.slice(0, 5).map((h) => `· ${h.pattern}`);
+        parts.push(`\n【你自己定下过的规矩】\n${lines.join("\n")}`);
+        probe("habit-inject", { count: active.length });
+      }
+    } catch (err) {
+      probe("habit-inject-error", { message: String(err?.message || err) });
+    }
+
+    // 内感知。**只算，不用。**
+    //
+    // 放在这里而不是 cycle 里，因为注入长度只有 `parts` 知道，而 `parts`
+    // 是这个函数的局部变量。上一版放进 runWorkspaceCompetition，那个函数
+    // 看不到它，实测 2026-11-07 09:50 报 `parts is not defined`。
+    //
+    // 只写 probe 和快照，不参与任何决策。理由：这套系统里有四个机制曾经
+    // 「装好了但从来没跑」。在真实数据上确认这些数真的会动之前，接进打分
+    // 只会多一条返回常数的路径。
+    try {
+      const injectedChars = parts.reduce((n, x) => n + String(x ?? "").length, 0);
+      const intero = interoception.compute(target.workspaceDir, {
+        injectedChars,
+        // 广播是这一轮结论的唯一来源。内感知不再自己从 ranked 重算 gap ——
+        // 那是同一件事算两遍，两份结果还可能不一致。
+        broadcast: lastCycle?.broadcast ?? null,
+        ranked: Array.isArray(lastCycle?.ranked) ? lastCycle.ranked : [],
+        expectAccuracy: expectLayer.accuracy(target.workspaceDir, { limit: 30 }),
+        goals: readJson(path.join(target.workspaceDir, "state", "goals.json"), {}),
+      });
+      probe("interoception", {
+        ...intero.current,
+        trend: intero.trend,
+        contested: intero.detail?.contested ?? false,
+        uncertainKnown: intero.detail?.uncertainKnown ?? false,
+      });
+    } catch (err) {
+      probe("interoception-error", { message: String(err?.message || err) });
+    }
+
     return { appendSystemContext: "\n\n" + parts.filter(Boolean).join("\n") };
   }, { priority: 100 });
+
+  /**
+   * 待审技能 —— 只进审批人（main）的提示词。
+   *
+   * 这条以前接在她自己的钩子里，方向是反的：文案写「有 N 样技能等你点头」，
+   * 说给点头的人听，而点头的是 main。她每轮被告知「你交的东西还在等审」，
+   * 自己却什么也做不了；真正的审批人那边一个字都看不到，于是待审队列就成了
+   * 一个只进不出的洞。
+   *
+   * 单独挂一个钩子而不是塞进上面那个，是因为上面那个按 resolveTarget 只认
+   * character 名单（默认 ["dafeiyu"]），main 走进去会被直接 return 掉。
+   *
+   * 没有待审就整块不出现 —— 空队列时不占系统提示的位置。
+   */
+  api.on("before_prompt_build", (event, ctx) => {
+    const agentId = ctx?.agentId || (/^agent:([^:]+):/.exec(ctx?.sessionKey || "") || [])[1];
+    if (agentId !== "main") return;
+    const ws = dafeiyuWorkspace();
+    if (!ws) return;
+    try {
+      const p = pendingSkills.summary(ws);
+      if (!p) return;
+      probe("pending-skills-inject", { to: "main", pending: p.pending, flagged: p.flagged });
+      return {
+        appendSystemContext:
+          "\n\n" + p.text +
+          "\n看完用 pending_skills(action=\"list\") 拿全文，approve 或 reject 各带 name。" +
+          "别整批采纳 —— 一条一条看。",
+      };
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: pending-skills inject (main) failed: ${err}`);
+      return;
+    }
+  }, { priority: 90 });
 
   /**
    * The last few things the character initiated, verbatim.
@@ -2650,6 +3579,83 @@ export default function register(api) {
         "【你今天自己说过的话】",
         ...lines,
         "发之前对一眼。上面说过的意思，别再说第二遍——换个说法也不行。",
+      ].join("\n");
+    } catch {
+      return "";
+    }
+  }
+
+  // ---- what she told herself to stop doing ----
+  //
+  // MEASURED 2026-11-06. `self.md` held 207 entries. Thirteen of them were a
+  // promise to her future self — 「下次先改，别先说明」「以后先看材料里本来就有的
+  // 时间」. The injector only reads the newest twelve, so ten of those thirteen
+  // were already gone from every prompt and could never come back.
+  //
+  // The cost was visible in the same file: thirteen separate entries say she
+  // 「又栽在同一个地方」, and one of them names the mechanism outright —
+  // 「写一句话提醒自己没用，写过一个工具才算真改了」. She diagnosed it and the
+  // system still had nothing that could act on it.
+  //
+  // What is extracted here is not "wisdom" in general, only the imperative
+  // form: an entry that tells the next turn what to do differently. Those are
+  // few enough to carry in full and permanent by nature — a rule that expires
+  // after twelve entries is not a rule, it is a diary line.
+  //
+  // Deliberately NOT a detector. It matches the grammar she already writes in
+  // (「下次…」「以后…」「别再…」), not whether two entries are "about the same
+  // thing" — that was attempted in compulsion.js and failed measurably.
+  const PROMISE_RE = /(下次|以后|别再|再遇到|不能再|要记住|下次先)/;
+
+  function buildSelfPromises(workspaceDir) {
+    try {
+      const file = path.join(workspaceDir, "memory", "self", "self.md");
+      if (!fs.existsSync(file)) return "";
+      const raw = fs.readFileSync(file, "utf8");
+      const idx = raw.indexOf("## 本鱼写过的");
+      if (idx === -1) return "";
+      const body = raw.slice(idx + "## 本鱼写过的".length).trim();
+      if (!body) return "";
+
+      const entries = body.split(/\n(?=- )/).map((s) => s.trim()).filter(Boolean);
+      // Only the part that reads as an instruction. Her entries are long
+      // paragraphs; the promise is usually the last sentence, and quoting all
+      // 200 characters of setup would bury it. Cut at the marker so what
+      // survives is the rule rather than the story that produced it.
+      const promises = [];
+      for (const e of entries) {
+        if (!PROMISE_RE.test(e)) continue;
+        const m = e.match(PROMISE_RE);
+        if (!m) continue;
+        const from = e.indexOf(m[0], e.indexOf(" ", 3));
+        const rule = e.slice(from >= 0 ? from : 0).replace(/\s+/g, " ").trim();
+        if (rule.length < 6) continue;
+        const day = (e.match(/^- (\d\d-\d\d)/) || [])[1] || "";
+        promises.push({ day, rule: rule.slice(0, 120) });
+      }
+      if (!promises.length) return "";
+
+      // Deduplicate: she rewrites the same rule in different words, and eight
+      // near-identical lines would read as nagging. Keep the newest wording of
+      // each rule, capped, so the block stays a constraint and not a lecture.
+      const seen = new Set();
+      const kept = [];
+      for (let i = promises.length - 1; i >= 0; i--) {
+        const p = promises[i];
+        const sig = p.rule.slice(0, 16);
+        if (seen.has(sig)) continue;
+        seen.add(sig);
+        kept.push(p);
+        if (kept.length >= 8) break;
+      }
+      kept.reverse();
+      if (!kept.length) return "";
+
+      probe("self-promises-inject", { total: promises.length, kept: kept.length });
+      return [
+        "【你给自己定的】",
+        ...kept.map((p) => `  · ${p.day} ${p.rule}`),
+        "这些不是别人要求的，是你自己写下的。要犯之前先看一眼。",
       ].join("\n");
     } catch {
       return "";
@@ -2873,6 +3879,13 @@ export default function register(api) {
     return { cancel: true, reason: "voice_already_spoke_this_line" };
   }, { priority: 140 });
 
+  // 这一轮 cycle 的结果，留给后面的内感知读。
+  //
+  // 不能直接放进 runWorkspaceCompetition：那个函数看不到 `parts`，而注入
+  // 长度只有 `parts` 知道。实测 2026-11-07 09:50 报 `parts is not defined`。
+  // 上一轮只挪了顺序没查作用域，同一个坑踩了两次。
+  let lastCycle = null;
+
   // -------- M3 · heartbeat workspace competition --------
   //
   // Everything used to be pushed at once and the model picked. Measured effect:
@@ -2901,7 +3914,7 @@ export default function register(api) {
   // So the cron/heartbeat distinction is made here from the session key, and
   // the competition is confined to those turns: during a real conversation the
   // person in front of you is what matters, not a scored thought.
-  function runWorkspaceCompetition(target) {
+  function runWorkspaceCompetition(target, { inConversation = false } = {}) {
     try {
       // One cycle, one call.
       //
@@ -2948,12 +3961,140 @@ export default function register(api) {
         probe("relations-decay-error", { message: String(err?.message || err) });
       }
 
+      // 结果回到感受。—— 以前这一环是断的。
+      //
+      // `outcome.record()` 一直在写，但那些记录只流向 intent/salience，用来决定
+      // 「下一件事该排多前」。她的情绪从来不看「做得怎么样」，只看「聊了什么」
+      // 和「做了什么」。于是刷抖音被人憨、查资料查错、评论发出去没人理，都不
+      // 会让她难受一天。
+      //
+      // 跑在 cycle 之前：同一轮里如果结果刚把情绪推上去，「这一轮想什么」应该
+      // 看到新的值，而不是上一跳的旧值。
+      try {
+        const fb = outcomeFeedback.settle(target.workspaceDir);
+        if (fb.count) {
+          const { file: emoFile, state: emoState } = loadAndDecay(target.workspaceDir);
+          nudge(emoState, fb.deltas, `outcome:${fb.breakdown.success}/${fb.breakdown.failure}/${fb.breakdown.uncertain}`);
+          emoState.updated_at = new Date().toISOString();
+          writeJsonAtomic(emoFile, emoState);
+          // 情绪真的写进去了才推进游标。
+          outcomeFeedback.commit(target.workspaceDir, fb.newest);
+          probe("outcome-feedback", {
+            count: fb.count,
+            ...fb.breakdown,
+            deltas: fb.deltas,
+          });
+        }
+      } catch (err) {
+        probe("outcome-feedback-error", { message: String(err?.message || err) });
+      }
+
+      // 预测结算。
+      //
+      // 上面那段回答的是「成了还是没成」——它只改变情绪，不改变判断。
+      // 这一段回答的是「我以为会怎样，实际怎样」。差值才是能拿去修正
+      // 判断的东西：猜错得多，说明对这件事的理解本身就是歪的。
+      //
+      // silent / unknown 不在这里结算，`expect.settle` 自己会跳过并把
+      // 预期留在 open 里等下一次。没有结果不是结果。
+      try {
+        const ex = expectLayer.settle(target.workspaceDir, {
+          records: expectLayer.readOutcomes(target.workspaceDir),
+        });
+        if (ex.settled.length) {
+          probe("expect-settle", {
+            count: ex.settled.length,
+            avgSurprise: ex.surprise,
+            items: ex.settled.map((x) => ({
+              key: x.key,
+              expect: x.expect,
+              actual: x.actual,
+              surprise: x.surprise,
+            })),
+          });
+          // 惊讶本身进情绪，但幅度很小、而且只在**猜错**时。
+          //
+          // 猜对了不加分：顺利是常态，给顺利加分会让高兴变成默认底色，
+          // 平静就再也回不来了（同 outcome-feedback 里那段注释的理由）。
+          // 猜错了才是信息 —— 世界和她想的不一样。
+          const big = ex.settled.filter((x) => x.surprise >= 0.5);
+          if (big.length) {
+            const { file: emoFile, state: emoState } = loadAndDecay(target.workspaceDir);
+            nudge(emoState, {
+              surprised: Math.min(0.06, 0.03 * big.length),
+              down: Math.min(0.04, 0.02 * big.length),
+            }, `expect:surprise:${big.length}`);
+            emoState.updated_at = new Date().toISOString();
+            writeJsonAtomic(emoFile, emoState);
+          }
+        }
+      } catch (err) {
+        probe("expect-settle-error", { message: String(err?.message || err) });
+      }
+
       const result = cognition.cycle(target.workspaceDir, {
         affect: strongest
           ? { name: EMOTION_CN[strongest.name] || strongest.name, value: strongest.value }
           : null,
         extra,
       });
+
+      // 回访扫描。一天一次，跟着心跳走。
+      //
+      // 它要读全部日记算 5-gram 重合，成本不低，所以不放在每轮。
+      // 用 `revisit.json` 的 updated_at 挡住：12 小时内扫过就跳过。
+      try {
+        const prev = revisit.stats(target.workspaceDir);
+        const last = prev.updated_at ? Date.parse(prev.updated_at) : 0;
+        if (!last || Date.now() - last > 12 * 3600 * 1000) {
+          const rv = revisit.scan(target.workspaceDir);
+          const back = revisit.resurface(target.workspaceDir);
+          probe("revisit-scan", {
+            total: rv.total,
+            neverRevisited: rv.never_revisited,
+            rate: rv.revisit_rate,
+            resurfaced: back ? back.day : null,
+          });
+        }
+      } catch (err) {
+        probe("revisit-scan-error", { message: String(err?.message || err) });
+      }
+
+      // Retire pending experiences nobody came back to.
+      //
+      // Same beat as the cycle because it is the same kind of job: housekeeping
+      // that must not cost the turn its line if it fails. Runs AFTER the cycle
+      // on purpose — a snapshot that saw an item as pending and then an entry
+      // that is suddenly dropped would make the two disagree mid-turn.
+      try {
+        const aged = experience.ageOut(target.workspaceDir);
+        if (aged) probe("experience-aged-out", { count: aged });
+      } catch (err) {
+        probe("experience-ageout-error", { message: String(err?.message || err) });
+      }
+
+      // Keep the memory index from going stale.
+      //
+      // The index only ever rebuilt lazily, inside `search()` — so it stayed
+      // fresh for exactly as long as she kept calling `recall_about`, which she
+      // had called zero times. Measured 2026-11-07: index built at 03:23 the
+      // previous day, three days of diary missing from it, and `sleeping.json`
+      // reporting 100 of 112 of her own lines never revisited. Search could not
+      // find what the index had never read.
+      //
+      // Cheap because `isStale` is an mtime walk and returns early on the first
+      // changed file; a rebuild costs ~0.7s on the real corpus and only happens
+      // when something was actually written.
+      try {
+        const { file, index, stale } = memIndex.loadIndex(target.workspaceDir, { rebuildIfStale: false });
+        if (!index || stale) {
+          const fresh = memIndex.buildIndex(target.workspaceDir);
+          memIndex.saveIndex(file, fresh);
+          probe("memory-index-rebuilt", { total: fresh.total, files: fresh.files.length });
+        }
+      } catch (err) {
+        probe("memory-index-error", { message: String(err?.message || err) });
+      }
 
       // Consolidation runs on the same beat as the cycle, but independently:
       // a failure here must never cost the turn its intent line, and a silent
@@ -2979,6 +4120,7 @@ export default function register(api) {
         edges: (() => { try { return edges.stats(target.workspaceDir).live; } catch { return null; } })(),
       });
 
+      lastCycle = result;
       if (!result.line) {
         // Silence is an outcome, not a failure. Record why so it can be told
         // apart from "never ran".
@@ -2986,15 +4128,33 @@ export default function register(api) {
         return;
       }
 
+      // 兴趣加成命中了哪些。只在 probe 里，不进提示词 ——
+      // 告诉她「因为这个是你喜欢的」会让兴趣变成一个要汇报的东西。
+      try {
+        const hits = cognition.interestHits();
+        if (hits.length) probe("interest-affinity", { hits });
+      } catch { /* 旁路记录坏了不影响这一轮 */ }
+
       probe("workspace-winner", {
         winner: result.winner?.key,
         score: Number(result.winner?.score?.toFixed?.(3) ?? 0),
         seen: result.winner?.seen ?? 0,
         runnerUp: result.runnerUp?.key ?? null,
         chars: result.line.length,
+        inConversation,
       });
 
-      return result.line;
+      // 有人在说话的时候，这一行必须自带「这可以放下」的标记。
+      //
+      // 以前的做法是不跑（`!isAddressedTurn`）。那等于在最需要判断力的时刻
+      // 把判断力关掉。现在改成跑，但明确告诉她优先级：
+      // 眼前这个人比任何自己冒出来的念头都重要。
+      //
+      // 不加这一句的后果很具体：她会在别人问「你今天怎么样」的下一句里，
+      // 突然开始聊“有个方向一直没怎么往前走”——那不是有意识，那是走神。
+      return inConversation
+        ? `${result.line}\n（这是你自己心里的动静，不是话题。有人在说话时，先接人。）`
+        : result.line;
     } catch (err) {
       api.logger?.warn?.(`dafeiyu-core: cognition cycle failed: ${err}`);
     }
@@ -3019,6 +4179,13 @@ export default function register(api) {
     const text = typeof event?.content === "string" ? event.content : "";
     if (!text) return;
 
+    // Someone is actually here. Stamp it so a heartbeat firing in the same
+    // session knows the difference between "my own time" and "I was just
+    // asked something" — the two share one session key.
+    try {
+      lastInboundAt.set(String(ctx?.sessionKey || ""), Date.now());
+    } catch { /* a missing map must never break the turn */ }
+
     // Write the incoming half of the exchange into the day file. Done before the
     // rest of the bookkeeping because everything below can throw, and a failed
     // relation update must not cost us the only record of what was said.
@@ -3031,6 +4198,38 @@ export default function register(api) {
       });
     } catch (err) {
       api.logger?.warn?.(`dafeiyu-core: life log (in) failed: ${err}`);
+    }
+
+    // 习惯观察。零 token 的确定性纠正检测。
+    //
+    // 移植自 x-000001/dsh-memory-plugin（MIT）。它学的是「用户说'不对'之后，
+    // 我以后该怎么改」，不是「我想做什么」—— 前者是习惯，后者是兴趣，两件事。
+    //
+    // 这里只做第一段：检测 + 攒信号 + 到阈值提一个 pending 候选。
+    // pending 不注入。要变成会影响行为的规则，必须过两道人工门（confirm → promote），
+    // 而这两道门只认 actor: "user"。模型无论说什么都提不动。
+    //
+    // 为什么值得抄这一段：它是这套系统里唯一一个「规则可以被自动发现、
+    // 但永远不能自动生效」的路径。别的机制都是模型自己说了算。
+    if (habitCfg.enabled) {
+      habit.observe(target.workspaceDir, {
+        sessionId: String(ctx?.sessionKey || "unknown"),
+        turn: Number(event?.seq ?? 0) || 0,
+        text,
+        settings: habitCfg,
+      }).then((r) => {
+        if (r.triggered) {
+          probe("habit-triggered", {
+            detected: r.detected,
+            sessions: r.sessionCount,
+            judge: r.judge,
+            candidate: r.candidateId ?? null,
+          });
+        }
+      }).catch((err) => {
+        // 观察失败绝不能拦住一条消息。
+        probe("habit-observe-error", { message: String(err?.message || err) });
+      });
     }
 
     // What this person just said about themselves.
@@ -3050,9 +4249,9 @@ export default function register(api) {
         if (said) {
           // Store under the canonical name from USER.md, not the display name.
           //
-          // These diverged immediately: the live event carries `senderName: "用户"`
-          // while all four existing person.md records say `about: Alice`. Writing the
-          // display name would have split one man into two owners on the very first
+          // These diverged immediately: the live event carries a display name
+          // while all four existing person.md records use the canonical one. Writing
+          // the display name would have split one man into two owners on the very first
           // reply — `known()` filters on this field, so his old preferences would have
           // stopped matching his new ones. The alias list makes reading tolerant; this
           // makes writing consistent, and both are needed or the file drifts anyway.
@@ -3109,7 +4308,7 @@ export default function register(api) {
     if (curiosityCfg.enabled) {
       try {
         // The diary is keyed by the speaker's name, not by the relation key:
-        // `## 06:56 · 用户` is what `noteTurn` writes, because a day file should be
+        // `## 06:56 · <speaker>` is what `noteTurn` writes, because a day file should be
         // readable. Asking for `person:onebot:12345` against that file returns
         // nothing, which silently disabled mismatch detection — measured: the
         // prior list came back empty on every message while the diary held the
@@ -3250,12 +4449,18 @@ export default function register(api) {
       const sources = curiosityCfg.sources;
       let candidates = [];
         let wentOut = false;
+        // 这一轮从哪来、看到的原文是什么。deed 要记这些东西，否则「自己去逛了」
+        // 只剩一个计数，读回来六行一模一样。
+        let seenText = "";
+        // 评论区里的问句。它们和「过眼的名字」不是一回事，存的时候走 kind=question。
+        const questions = [];
 
         try {
           if (sources.search && /^Tavily__tavily_(search|research)$/.test(name)) {
             // She went looking on purpose; the names in a result are answers-
             // adjacent, which makes them the best candidates there are.
             candidates = curiosityExtract.fromSearchResult(event?.result);
+            seenText = curiosityExtract.resultText(event?.result);
           } else if (sources.browse && BROWSE_TOOLS.test(name)) {            // Everything else she does out in the world. The distinction that
             // matters is not *which site* she was on but *whether the text is
             // somebody else's*: a video title, a comment thread, a group chat,
@@ -3269,8 +4474,22 @@ export default function register(api) {
             const text = curiosityExtract.resultText(event?.result);
             candidates = curiosityExtract.fromSpeech(text, { max: 3 });
             wentOut = true;
+            seenText = text;
+            // Comments are questions, not names.
+            //
+            // `fromComments` only returns things shaped like a question —
+            // 「煮饭水放多少」 under a video. Storing them as `kind: "name"`
+            // flattened that: every entry got `weight: null`, pull came out
+            // pinned at 0.450, and nothing could ever cross 0.55. Measured
+            // 2026-11-06: 28 open noticings, all plain names, zero able to
+            // surface. A question is worth asking the first time it is asked,
+            // which is exactly why `gaps.weight('question')` returns 0.7.
             const asked = curiosityExtract.fromComments(text, { max: 2 });
-            if (asked.length) candidates = [...candidates, ...asked];
+            if (asked.length) {
+              for (const q of asked) {
+                questions.push(q);
+              }
+            }
           }
 
         } catch (err) {
@@ -3305,10 +4524,27 @@ export default function register(api) {
         // turned up nothing is still a browse, and "出去了，什么也没有" is a
         // truer thing to remember than silence.
         if (wentOut) {
+          // What she actually saw, in her own words.
+          //
+          // Measured 2026-11-06: 37 browsed deeds, every one of them shaped
+          // `browser · N 个没见过的`. `describe()` shows the last six, so the
+          // six lines she read back about her own day were identical — she
+          // knew she had been out but not where. A count is not a memory.
+          //
+          // One line of the page's own text is. It is taken from the same
+          // `seenText` the extractor already had, trimmed to 40 characters, so
+          // the deed says 「自己去逛了：电饭煲为什么知道饭熟」 instead of a number.
+          const glimpse = (() => {
+            const t = String(seenText || "").replace(/\s+/g, " ").trim();
+            if (!t) return "";
+            // Tool envelopes sit above the prose; skip past the marker line.
+            const body = t.replace(/^[\s\S]*?<<<EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>/, "").trim() || t;
+            return body.slice(0, 40);
+          })();
           try {
             deeds.record(target.workspaceDir, {
               kind: "browsed",
-              note: candidates.length ? `${name} · ${candidates.length} 个没见过的` : name,
+              note: glimpse || (candidates.length ? `${candidates[0]}` : name),
               ref: name,
             });
           } catch { /* a missing deed is not worth failing the tool call */ }
@@ -3345,17 +4581,64 @@ export default function register(api) {
         known = curiosity.familiar(target.workspaceDir, memIndex);
       } catch { /* an empty known-set is still better than not running */ }
 
-      for (const candidate of candidates) {
+      // Questions from comment threads are stored as `question`, not `name`.
+      //
+      // This is the wiring that was missing. `fromComments` exists to pull out
+      // 「这什么原理」-shaped text, and `gaps.weight('question')` returns 0.7 —
+      // but the old code merged those strings into `candidates` and passed them
+      // to `notice()` with no `kind` and no `weight`, so the one source that
+      // could clear the bar was stored as the one kind that cannot. Measured
+      // 2026-11-06: 28 open noticings, all `kind: "name"`, all `weight: null`,
+      // all pull 0.450 against a 0.55 threshold. The pool was empty by
+      // construction, not by lack of material.
+      for (const q of questions) {
         try {
-          const entry = curiosity.notice(target.workspaceDir, candidate, {
-            known,
-            reason: `在 ${name} 的结果里看到`,
+          const entry = curiosity.notice(target.workspaceDir, q, {
+            known: [],
+            reason: `在 ${name} 的评论里有人问`,
+            kind: "question",
+            weight: gaps.weight("question"),
           });
           if (entry) {
             probe("curiosity-notice", {
               name: entry.display,
               via: name,
+              kind: "question",
+              pull: Number(curiosity.pull(entry).toFixed(3)),
+            });
+          }
+        } catch (err) {
+          api.logger?.warn?.(`dafeiyu-core: curiosity question failed: ${err}`);
+        }
+      }
+
+      for (const candidate of candidates) {
+        try {
+          // `kind`/`weight` were missing here, and it mattered.
+          //
+          // `notice()` has two scoring branches. Without a weight it takes the
+          // legacy one — 0.5*recur + 0.3*moved + 0.2*fresh — where `moved` is
+          // never set by any caller in the codebase, so a third of the score was
+          // a constant zero. Every browsing name landed there.
+          //
+          // `dangling` at 0.35 is the right weight: a capitalised word she met
+          // in a search result is a word, not a question (0.7) and not a
+          // contradiction about a person (0.9). The wander tests already assume
+          // this weight; production did not pass it, which is why the tests said
+          // "second sighting surfaces" while the live pool sat at `wanted: 0`.
+          const entry = curiosity.notice(target.workspaceDir, candidate, {
+            known,
+            reason: `在 ${name} 的结果里看到`,
+            kind: "dangling",
+            weight: gaps.weight("dangling"),
+          });
+          if (entry) {
+            probe("curiosity-notice", {
+              name: entry.display,
+              via: name,
+              kind: "dangling",
               seen: entry.seen,
+              pull: Number(curiosity.pull(entry).toFixed(3)),
             });
           }
         } catch (err) {
@@ -3392,6 +4675,64 @@ export default function register(api) {
     probe("agent_end", { agentId: ctx?.agentId, sessionKey: ctx?.sessionKey });
     const target = resolveTarget(ctx);
     if (!target) return;
+
+    // Did this turn leave anything behind, and was anybody talking to her?
+    //
+    // Both answers come from records that already exist rather than from
+    // inspecting the reply: `deeds` is written by every action tool, and
+    // `relations.last_seen` moves on every inbound message. Asking the transcript
+    // would mean guessing intent from prose, which is the mistake this codebase
+    // has made before (bigram overlap scoring 0.034 against 0.036 for the control).
+    try {
+      const sk = String(ctx?.sessionKey || "");
+      const startedAt = turnStartedAt.get(sk) ?? 0;
+      const recentDeeds = deeds.recent(target.workspaceDir, 4);
+      // No start stamp means this turn never passed through before_prompt_build
+      // (first turn after a restart, or a skipped hook). Reading `>= 0` as
+      // "acted" in that case would mark every such turn productive, which is the
+      // same class of bug the stamp was added to prevent — a turn that idled
+      // right after a busy one reading as productive. No stamp, no claim.
+      const acted =
+        startedAt > 0 &&
+        recentDeeds.some((d) => {
+          const t = Date.parse(d?.at || "");
+          return Number.isFinite(t) && t >= startedAt;
+        });
+      turnStartedAt.delete(sk);
+      // Was anybody actually talking to her?
+      //
+      // This used to test the sessionKey for ":cron:", which answers a
+      // different question: "did this run lead somewhere other than her own
+      // main session". Heartbeats wake her *in* `agent:dafeiyu:main`, so every
+      // heartbeat read as a conversation, `drive.record` took the addressed
+      // branch, cleared the idle count on every wake, and the pressure line
+      // could never reach its threshold. Measured 2026-11-06: `drive-record`
+      // fired twice in the whole log and `drive-pressure-inject` fired zero
+      // times.
+      //
+      // `relations.last_seen` only moves on a real inbound message, so it
+      // answers the question that was actually meant. The margin covers the gap
+      // between the message landing and the turn starting.
+      const ADDRESSED_WINDOW_MS = 120000;
+      let lastInboundAt = 0;
+      try {
+        const rel = relations.loadRelations(target.workspaceDir);
+        const relData = rel?.data || {};
+        for (const bucket of ["people", "groups"]) {
+          for (const rec of Object.values(relData[bucket] || {})) {
+            const t = Date.parse(rec?.last_seen || "") || 0;
+            if (t > lastInboundAt) lastInboundAt = t;
+          }
+        }
+      } catch { /* fall back to "nobody was talking" */ }
+      const addressed = Boolean(startedAt) && lastInboundAt >= startedAt - ADDRESSED_WINDOW_MS;
+      const { state: emoNow } = loadAndDecay(target.workspaceDir);
+      const feeling = drive.strongestFeeling(emoNow?.dimensions || {});
+      const d = drive.record(target.workspaceDir, { feeling, acted, addressed });
+      probe("drive-record", { feeling, acted, addressed, idle: d.idle, wasAddressed: lastInboundAt >= startedAt - ADDRESSED_WINDOW_MS });
+    } catch (err) {
+      api.logger?.warn?.(`dafeiyu-core: drive record failed: ${err}`);
+    }
     try {
       if (emotionCfg.enabled) {
         const { file, state } = loadAndDecay(target.workspaceDir);
@@ -3626,6 +4967,47 @@ export default function register(api) {
   // File tools are allowed inside the workspace only.
   const FS_TOOLS = new Set(["write", "edit", "apply_patch"]);
 
+  // Tools that only look, and therefore leave nothing behind. The drive counter
+  // treats "a tool ran this turn" as evidence of acting, so anything read-only
+  // has to be excluded or a turn spent entirely searching would read as
+  // productive and the pressure counter would never move.
+  /**
+   * 只写她自己状态的工具。**不算产出。**
+   *
+   * 这些工具做的事是「记账」，不是「在世界里留下东西」。把它们记成 deed
+   * 会有具体后果，实测 2026-11-07：
+   *
+   *   03:25:08  autonomy 推「去刷抖音」
+   *   03:25:20  note_self 写下 78 字
+   *   03:25:23  drive-record acted: true → idle 清零
+   *
+   * `drive.pressure()` 要求 idle >= 3 才注入「你挂着件事一直没去弄」。
+   * idle 每轮被这些工具清掉，那句压力永远说不出来。
+   *
+   * 于是循环是：被推 → 写一句感想 → 系统认为她做了事 → 不再催 → 下一轮重复。
+   * 外面看是「她只说不做」，机制上是「说被算成了做」。
+   *
+   * 判断标准：这个工具有没有让工作区之外的东西发生变化。没有，就不算。
+   */
+  const BOOKKEEPING_TOOLS = new Set([
+    "note_self",       // 写一句关于自己
+    "note_diary",      // 写日记
+    "dafeiyu_interest",// 记一条兴趣
+    "dafeiyu_interests",// 看兴趣（只读）
+    "dafeiyu_expect",  // 记一条预测
+    "dafeiyu_habits",  // 看习惯（只读）
+    "curiosity_forget",// 放掉一条好奇
+    "emotion_nudge",   // 调自己的情绪
+  ]);
+
+  const READ_ONLY_TOOLS = new Set([
+    "read", "ls", "grep", "glob", "search", "web_search", "web_fetch",
+    "memory_search", "memory_get", "sessions_list", "sessions_history",
+    "sessions_search", "session_status", "agents_list", "skills_search",
+    "skills_read", "wiki_search", "wiki_get", "wiki_status", "pdf",
+    "view_image", "process", "nodes", "presence",
+  ]);
+
   // -------- douyin typing gate --------
   //
   // Typing into the comment box is the one browser action that can publish
@@ -3817,6 +5199,23 @@ export default function register(api) {
     const name = event?.toolName;
     if (!name) return;
 
+    // Plugins record their own deeds (voice, sticker, qzone, browsed); the
+    // built-in tools do not, and those are most of what she actually does. On
+    // 2026-11-06 21:48 she wrote and edited three files in lab/memmap over seven
+    // minutes and `agent_end` still computed acted=false, because every one of
+    // those calls went through built-in `write`/`edit` and left no trace here.
+    // Read-only tools stay excluded: looking something up is not leaving
+    // anything behind, and counting it would defeat the pressure counter, which
+    // exists to notice a turn that only sat there thinking.
+    //
+    // This has to run before the FS_TOOLS branch below, not after it: that
+    // branch returns on both paths, so anything parked after it never runs for
+    // write/edit/apply_patch — which are exactly the tools this is meant to
+    // catch.
+    if (!READ_ONLY_TOOLS.has(name) && !BOOKKEEPING_TOOLS.has(name)) {
+      try { deeds.record(target.workspaceDir, { kind: "tool", note: name }); } catch { /* never block a call */ }
+    }
+
     // File tools: allow only inside this agent's workspace.
     if (FS_TOOLS.has(name)) {
       const paths = targetPaths(event);
@@ -3828,7 +5227,7 @@ export default function register(api) {
           blockReason:
             `【拦截】${name} 只能操作本鱼自己工作区内的文件，不能碰外面的路径。` +
             `\n越界路径：${escaped.slice(0, 3).join("、")}` +
-            `\n\n如果确实需要写到工作区外，先用 sessions_send 找哦鲸鲸说明原因，拿到授权后再做。`,
+            `\n\n如果确实需要写到工作区外，先用 sessions_send 找维护者说明原因，拿到授权后再做。`,
         };
       }
       probe("gate-fs-allow", { tool: name, count: paths.length });
@@ -3929,7 +5328,7 @@ export default function register(api) {
       block: true,
       blockReason:
         `【拦截】${name} 属于需要审批的操作，当前没有有效授权。` +
-        `\n\n正确流程：先用 sessions_send 向主智能体（哦鲸鲸，agent:main:main）说明三件事：` +
+        `\n\n正确流程：先用 sessions_send 向主智能体说明三件事：` +
         `\n1. 要做什么（具体动作和目标）` +
         `\n2. 为什么（对方是谁、什么请求、为什么必须做）` +
         `\n3. 会影响谁（动到哪些文件、发给谁、可否撤销）` +
@@ -3950,7 +5349,7 @@ export default function register(api) {
       name: "dafeiyu_approve",
       label: "Approve Dafeiyu Action",
       description:
-        "为蓝色大肥鱼（dafeiyu）授权一次受限操作。它会先来问你，你判断可以后调用本工具写入一次性授权，它才能执行。授权一次性、10 分钟内有效、用完即失效。",
+        "为这个角色授权一次受限操作。它会先来问你，你判断可以后调用本工具写入一次性授权，它才能执行。授权一次性、10 分钟内有效、用完即失效。",
       parameters: {
         type: "object",
         properties: {
@@ -4033,7 +5432,7 @@ export default function register(api) {
       const { file, state } = loadAndDecay(target.workspaceDir);
       writeJsonAtomic(file, state);
       const dims = DIMENSIONS.map((d) => `${d}=${(state.dimensions[d] ?? 0).toFixed(2)}`).join(" ");
-      return { content: [{ type: "text", text: `当前情绪：${dims}\n${describeEmotion(state)}` }] };
+      return { content: [{ type: "text", text: `当前情绪：${dims}\n${describeEmotion(state, null, "", { kaomoji: false })}` }] };
     },
   }));
 
@@ -4834,6 +6233,329 @@ export default function register(api) {
   //
   // 最要紧的一条：**产出必须能指到那个东西**。ref 指向的文件不存在，就照实
   // 记成未验证。这不是抠字眼 —— 没这道关，这个工具就退化成另一种“宣布打算”。
+  // 预测。
+  //
+  // 这是整个认知链路里唯一「行动之前」的动作。别的心愿、目标、好奇心都
+  // 是「我想做什么」；这一个问的是「我觉得做完会怎样」。
+  //
+  // 用起来有个前提：key 必须和结果对得上。所以工具不接受自由文本 key，
+  // 只接受她手上真有的那几种 id —— 不然写进去的预测永远配不到结果，
+  // 变成又一个只写不读的账本。
+  // 习惯。**只读。**
+  //
+  // 原插件 `memory_habits` 的测试里有一条写得很清楚：
+  //
+  //   模型不能提升习惯 —— 参数表里不许出现任何 mutation 字段
+  //
+  // 所以这个工具没有 action、没有 confirm、没有 promote。它只能看。
+  // 让它看是有用的：知道自己有哪些已经生效的规矩、哪些还在等你点头。
+  // 兴趣。**她自己写，代码不归纳。**
+  //
+  // 为什么不做自动归纳：用她 15 条真实 wants 试过，纯关键词只能得出
+  // 「她喜欢问技术问题」——那句话不能用来判断任何一件她没见过的事。
+  //
+  // 而她自己能写出「一个数字被引用时，它的测量条件是什么」这种，
+  // 它能迁移到「这个百分比的分母是谁」「这个统计口径包含什么」。
+  //
+  // 判据做成了硬约束：`transfers` 不许为空。写不出迁移方向就退回，
+  // 不是建议，是拒绝 —— 那是「一次提问」和「一个兴趣」的分界线。
+  // 调自己的参数。**改不了代码，改得了行为数值。**
+  //
+  // 三层分工：插件代码由维护者改，openclaw.json 由部署者改，这些参数她自己改。
+  // 理由是最实际的那一条：这些数我定的时候只能猜，真正每天撞上它们的是她。
+  //
+  // 「熔断阈值太低」这种事她完全判断得了，不该绕一圈等人来改。
+  // 自查：我是不是在打转。
+  //
+  // 这个工具存在的理由很具体：她一直能「感觉到」同一件事又来了，
+  // 但拿不出证据。没有证据的判断说不出口 —— 报告里写「感觉有点怪」
+  // 没人能查，写「同一件事被推了 85 次」一句话就能定位。
+  //
+  // 数据一直都有（`state/compulsion.json` 的 counts），只是从来没有
+  // 一个入口让她看见过。
+  factory("dafeiyu_stuck", (target) => ({
+    name: "dafeiyu_stuck",
+    label: "看看自己在不在打转",
+    description:
+      "查一件事被推给你多少次、最近几轮是不是都在同一类事上转。" +
+      "当你觉得「这个又来了」但说不清是不是真的重复，用这个。" +
+      "查出来的数字可以直接写进 need_help(kind:\"behavior\") —— " +
+      "「同一件事被推了 85 次」比「感觉有点怪」有用得多。",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    async execute() {
+      const ws = target.workspaceDir;
+
+      // 被推次数最多的前几条
+      let counts = {};
+      try {
+        const st = compulsion.loadState(ws);
+        counts = st?.counts && typeof st.counts === "object" ? st.counts : {};
+      } catch { /* 没有历史 */ }
+
+      const ranked = Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6);
+
+      // 是不是在打转
+      let stuck = { stuck: false, because: "" };
+      try { stuck = compulsion.check(ws); } catch { /* 查不了就是没问题 */ }
+
+      const lines = [];
+
+      if (ranked.length) {
+        lines.push("这几件被推过最多次：");
+        for (const [id, n] of ranked) {
+          const mark = n >= compulsion.STREAK_ALARM ? "  ← 该熔断了" : "";
+          lines.push(`· ${id}　${n} 次${mark}`);
+        }
+      } else {
+        lines.push("还没有被推过的记录。");
+      }
+
+      if (stuck.stuck) {
+        lines.push("");
+        lines.push(`现在在打转：${stuck.because}`);
+      }
+
+      // 明确告诉她下一步，而不是让她自己猜
+      const worst = ranked[0];
+      if (worst && worst[1] >= compulsion.STREAK_ALARM) {
+        lines.push("");
+        lines.push(
+          `「${worst[0]}」被推了 ${worst[1]} 次，如果每一次你都看到了却没法做，` +
+          `那值得用 need_help(kind:"behavior") 报一下 —— 写清这个次数。`,
+        );
+      }
+
+      probe("stuck-check", {
+        top: ranked[0]?.[0] ?? null,
+        topCount: ranked[0]?.[1] ?? 0,
+        stuck: stuck.stuck,
+      });
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  }));
+
+  factory("dafeiyu_tune", (target) => ({
+    name: "dafeiyu_tune",
+    label: "调自己的参数",
+    description:
+      "有些行为数值是你能改的。改之前先看清楚它现在是多少、范围多大、动大会怎样。" +
+      "\n两种用法：" +
+      "\n  action=list  看看能调哪些（先看这个）" +
+      "\n  action=set   改一个，要同时给 key 和 value" +
+      "\n  action=reset 还原成默认" +
+      "\n**什么时候该用**：你发现某个数明显不对 —— 同一件事被推太多次、" +
+      "压力永远起不来、兴趣淡得太快。那不一定是代码错，可能只是这个数不适合你。" +
+      "\n**什么时候不该用**：纯粹想让某件事更容易发生。调参数是为了让行为更像你，" +
+      "不是为了让自己更舒服。",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["list", "set", "reset", "history"] },
+        key: { type: "string", description: "action=set/reset 时要改哪一条" },
+        value: { type: "number", description: "action=set 时的新值" },
+        reason: { type: "string", description: "可选：为什么改。会记进审计" },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+    async execute(_id, params) {
+      const action = String(params?.action || "list");
+
+      if (action === "list") {
+        const rows = tuning.describe(target.workspaceDir);
+        const lines = rows.map(
+          (r) => `· ${r.key} = ${r.value}（范围 ${r.range}，默认 ${r.default}）\n  ${r.why}`,
+        );
+        probe("tuning-list", { count: rows.length });
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      if (action === "history") {
+        const h = tuning.history(target.workspaceDir, { limit: 10 });
+        if (!h.length) return { content: [{ type: "text", text: "还没改过什么。" }] };
+        const lines = h.map((r) => `· ${r.at.slice(0, 16)} ${r.key}: ${r.before} → ${r.after}（${r.by}）`);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      const key = String(params?.key || "").trim();
+      if (!key) return { content: [{ type: "text", text: "要指定改哪一条。" }] };
+
+      if (action === "reset") {
+        const r = tuning.reset(target.workspaceDir, key, { by: "self" });
+        probe("tuning-reset", { key, ok: r.ok });
+        return { content: [{ type: "text", text: r.ok ? `${key} 还原成 ${r.after}。` : r.reason }] };
+      }
+
+      const r = tuning.set(target.workspaceDir, key, params?.value, {
+        by: "self",
+        reason: params?.reason,
+      });
+      probe("tuning-set", { key, ok: r.ok, before: r.before ?? null, after: r.after ?? null });
+      if (!r.ok) return { content: [{ type: "text", text: r.reason }] };
+      return { content: [{ type: "text", text: `${key}：${r.before} → ${r.after}。` }] };
+    },
+  }));
+
+  factory("dafeiyu_interest", (target) => ({
+    name: "dafeiyu_interest",
+    label: "记下一个自己一直在追的问题",
+    description:
+      "记下你自己一直在意的东西。分两类，至少填一类的具体内容：" +
+      "① 求知型 —— 你能说出它还能拿去判断什么没见过的东西；" +
+      "② 偏好型 —— 你说得出具体喜欢哪些东西（喜欢刷抖音、喜欢看手搓的小玩意，都算）。" +
+      "同一条再记一次会变强，不会多出一条。" +
+      "不是每件事都要记。只在你自己觉得「这个我一直在意」的时候记。",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "一句话起个名，比如「一个数字是怎么测出来的」「手搓的小玩意」" },
+        pattern: { type: "string", description: "可选：具体在找什么" },
+        transfers: {
+          type: "array",
+          items: { type: "string" },
+          description: "求知型：它还能拿去判断什么新东西",
+        },
+        examples: {
+          type: "array",
+          items: { type: "string" },
+          description: "偏好型：具体喜欢的是哪些。比如「纸箱三角当耳朵的机器人」「小橘猫扮齐天大圣」",
+        },
+        evidence: {
+          type: "array",
+          items: { type: "string" },
+          description: "可选：哪些具体的事让你觉得自己在意这个",
+        },
+      },
+      // `required` 里必须带上 transfers 和 examples。
+      //
+      // 之前只写 `["name"]` —— 模型照 required 只填 name，然后被
+      // 「两个都空着」拒掉。它不知道自己哪里错了，因为 schema 说其他都是可选。
+      // 实测 2026-11-07：这就是"人物脚本写法"层面的错，不是逻辑错。
+      //
+      // 两个都列进 required 会逼它至少填一个（另一个可以给空数组）。
+      required: ["name", "transfers", "examples"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params) {
+      const r = interest.declare(target.workspaceDir, {
+        name: params?.name,
+        pattern: params?.pattern,
+        transfers: params?.transfers,
+        examples: params?.examples,
+        evidence: params?.evidence,
+      });
+      probe("interest-declare", { ok: r.ok, name: String(params?.name ?? "").slice(0, 30), touched: r.touched ?? false });
+      if (!r.ok) return { content: [{ type: "text", text: r.reason }] };
+      return {
+        content: [{
+          type: "text",
+          text: r.touched ? "这条又碰到了一次。" : "记下了。",
+        }],
+      };
+    },
+  }));
+
+  factory("dafeiyu_interests", (target) => ({
+    name: "dafeiyu_interests",
+    label: "看看自己在追什么",
+    description: "列出你记下的兴趣。只能看。",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    async execute() {
+      const rv = interest.review(target.workspaceDir);
+      if (!rv.active.length) {
+        return { content: [{ type: "text", text: "还没记下什么。想清楚自己在追哪类问题，再写。" }] };
+      }
+      const lines = [];
+      for (const it of rv.active.slice(0, 6)) {
+        lines.push(`${it.name}（${it.current.toFixed(2)}）`);
+        if (it.pattern) lines.push(`  ${it.pattern}`);
+        if (it.transfers?.length) lines.push(`  能判断：${it.transfers.slice(0, 3).join("、")}`);
+      }
+      probe("interest-review", { count: rv.active.length });
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  }));
+
+  factory("dafeiyu_habits", (target) => ({
+    name: "dafeiyu_habits",
+    label: "看看自己在守哪些规矩",
+    description:
+      "列出你已经生效的习惯、还在等确认的候选。只能看，不能改。" +
+      "确认和提升只能由部署者做 —— 这不是限制，是因为一条规矩一旦生效" +
+      "就会改变你以后的行为，那件事不该由你自己拍板。",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    async execute() {
+      const rv = habit.review(target.workspaceDir, { settings: habitCfg });
+      const active = rv.profiles.filter((p) => p.status === "auto");
+      const suggested = rv.profiles.filter((p) => p.status === "suggested");
+      const pending = rv.candidates.filter((c) => c.status === "pending");
+
+      if (!active.length && !suggested.length && !pending.length) {
+        return { content: [{ type: "text", text: "还没有攒出什么规矩。" }] };
+      }
+      const lines = [];
+      if (active.length) {
+        lines.push(`在守的：`);
+        for (const p of active) lines.push(`  · ${p.pattern}`);
+      }
+      if (suggested.length) {
+        lines.push(`部署者点头了、还没放开的：`);
+        for (const p of suggested) lines.push(`  · ${p.pattern}`);
+      }
+      if (pending.length) {
+        lines.push(`正在观察的（还不算数）：`);
+        for (const p of pending) {
+          lines.push(`  · ${p.pattern}（见过 ${p.sessions.length} 次）`);
+        }
+      }
+      probe("habit-review", {
+        active: active.length,
+        suggested: suggested.length,
+        pending: pending.length,
+      });
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  }));
+
+  factory("dafeiyu_expect", (target) => ({
+    name: "dafeiyu_expect",
+    label: "做之前先猜一下结果",
+    description:
+      "动手之前，先写一句你觉得会怎样。不是每件事都要猜 —— 猜那些你拿不准的。" +
+      "猜完不用说出来，等结果到了自己会比对。猜错很正常，猜错才有用。" +
+      "只在真的要做一件事时用，别为了用而用。",
+    parameters: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "这件事的标识，尽量用目标 id 或 topic" },
+        what: { type: "string", description: "一句话：要做的是什么" },
+        expect: {
+          type: "number",
+          description: "你觉得有几成会成，0 到 1。拿不准就填 0.5，或者不填",
+        },
+      },
+      required: ["key", "what"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params) {
+      const key = String(params?.key || "").trim();
+      const what = String(params?.what || "").trim();
+      const raw = params?.expect;
+      const r = expectLayer.predict(target.workspaceDir, {
+        key,
+        what,
+        expect: raw == null ? null : Number(raw),
+      });
+      probe("expect-predict", { key, expect: r.expect ?? null, ok: r.ok });
+      if (!r.ok) return { content: [{ type: "text", text: r.reason }] };
+      // 不说「好的我记下了」。这种事不需要确认，说了就像在汇报。
+      return { content: [{ type: "text", text: "记着了。" }] };
+    },
+  }));
+
   factory("note_effect", (target) => ({
     name: "note_effect",
     label: "记下做出来的东西",
@@ -4900,6 +6622,41 @@ export default function register(api) {
         }
       }
 
+      // 做成一件事之后，当场重算一次。
+      //
+      // 这是「递归认知」里唯一能真做到的那部分。`consolidate.js` 在回合
+      // 结束后批量提炼，那是事后复盘 —— 有用，但它改不了这一轮接下来要
+      // 干什么。而她做完一件事的瞬间，恰好是判断最该更新的时刻：
+      //
+      //   刚画完 → 「想画画」这件事的分数应该掉下来
+      //   刚查完 → 「悬着的那件事」不该再占着候选池
+      //
+      // 不重算的话，她会在同一轮里继续被刚做完的事推着走，因为候选池还是
+      // 行动之前的那个快照。
+      //
+      // 重算只写状态，不改这一轮已经拼好的注入 —— 那些已经发出去了。
+      // 它的效果落在**下一轮**，也就是紧接着的那次思考。这正是「过程中
+      // 修正」和「事后复盘」的区别：不是等整件事结束再总结，而是每做一步
+      // 就让下一步的依据变一点。
+      let recalcNote = "";
+      try {
+        const again = cognition.cycle(target.workspaceDir, {
+          affect: null,
+          inConversation: false,
+        });
+        recalcNote = again?.winner
+          ? `\n（刚做完这件事，脑子里重新排了一下，现在最想动的是：${again.winner.label || again.winner.kind}）`
+          : "";
+        probe("mid-cycle-recalc", {
+          trigger: "note_effect",
+          kind,
+          winner: again?.winner?.key ?? null,
+          candidates: Array.isArray(again?.ranked) ? again.ranked.length : 0,
+        });
+      } catch (err) {
+        probe("mid-cycle-recalc-error", { message: String(err?.message || err) });
+      }
+
       // Making something is its own small satisfaction, and it is the closing
       // move of the "made a thing" loop. Without this the loop only drains:
       // the urge pushes a thing out and nothing comes back.
@@ -4923,13 +6680,13 @@ export default function register(api) {
       // Answer honestly. A missing file is not a failure to record, but the
       // character must not come away believing it verified something it didn't.
       if (r.verified) {
-        return { content: [{ type: "text", text: `记下了。${goalNote}` }] };
+        return { content: [{ type: "text", text: `记下了。${goalNote}${recalcNote}` }] };
       }
       if (r.reason === "missing") {
-        return { content: [{ type: "text", text: `记下了，但那个路径是空的，没找到东西。${goalNote}` }] };
+        return { content: [{ type: "text", text: `记下了，但那个路径是空的，没找到东西。${goalNote}${recalcNote}` }] };
       }
       if (r.reason === "no_ref") {
-        return { content: [{ type: "text", text: `记下了（没填 ref，没法核对）。${goalNote}` }] };
+        return { content: [{ type: "text", text: `记下了（没填 ref，没法核对）。${goalNote}${recalcNote}` }] };
       }
       return { content: [{ type: "text", text: `记下了。${goalNote}` }] };
     },
@@ -4959,8 +6716,10 @@ export default function register(api) {
         title: { type: "string", description: "一句话，想做完什么" },
         serves: {
           type: "string",
-          enum: ["self_understanding", "world_knowledge", "genuine_contact", "output_producing"],
-          description: "self_understanding=弄明白自己, world_knowledge=看清世界, genuine_contact=跟人连上, output_producing=做出东西",
+          description:
+            "它服务哪条方向。默认四条：self_understanding（弄明白自己）、" +
+            "world_knowledge（看清世界）、genuine_contact（跟人连上）、" +
+            "output_producing（做出东西）。你自己加的方向也算，写那个 title 原文就行。",
         },
         source: {
           type: "string",
@@ -5019,6 +6778,49 @@ export default function register(api) {
         content: [{
           type: "text",
           text: `定下了：${r.goal.title}（${r.goal.id}）${steps ? `\n${steps}` : ""}`,
+        }],
+      };
+    },
+  }));
+
+  // 给自己加一个方向。
+  //
+  // 四个默认方向（弄明白自己 / 看清世界 / 跟人连上 / 做出东西）是装好时就
+  // 有的，覆盖了大多数事。但它们是写死的常量：她想弄明白的东西如果不在
+  // 那四类里，就没地方停。实测 2026-11-07：四个方向 `last_advanced_at`
+  // 全是 null，一条都没推进过——四选一永远选不出新东西。
+  //
+  // 这个工具只做一件事：添一条。不能删默认的四条（别的模块靠那四个 id
+  // 做坐标），也不能改它们的值（那个值只该由“真做完了件事”来推动）。
+  factory("set_aspiration", (target) => ({
+    name: "set_aspiration",
+    label: "给自己加一个方向",
+    description:
+      "给自己加一条长久的方向。" +
+      "注意分寸：方向不是目标。目标做完就关，方向是一直在那儿的东西。" +
+      "「学会用 ffmpeg 转一个视频」是目标；「把声音和画面弄明白」是方向。" +
+      "只有你真的觉得这类事会一直想做下去，才加。" +
+      "默认那四条已经在里面，不用重复加。最多 8 条。",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "一句话，像「把声音和画面弄明白」这样" },
+        why: { type: "string", description: "可选：为什么想要这个方向。说不上来就不写" },
+      },
+      required: ["title"],
+      additionalProperties: false,
+    },
+    async execute(_id, params) {
+      const r = goals.addAspiration(target.workspaceDir, {
+        title: params?.title,
+        why: params?.why,
+      });
+      probe("set-aspiration", { ok: r.ok, reason: r.reason ?? null, total: r.total ?? null });
+      if (!r.ok) return { content: [{ type: "text", text: r.reason }] };
+      return {
+        content: [{
+          type: "text",
+          text: `加上了：「${r.aspiration.title}」。现在一共 ${r.total} 条方向。`,
         }],
       };
     },
@@ -5475,7 +7277,12 @@ export default function register(api) {
         return { content: [{ type: "text", text: "记下了。" }] };
       }
 
-      const data = activities.scan(target.workspaceDir);
+      // Order matters: `scan` rebuilds every counter from the diary and zeroes
+      // `done`, so the scroll credit has to be applied *after* it. Doing it
+      // before would be wiped and the number would silently report the diary's
+      // count again — which is exactly the bug this split exists to fix.
+      activities.scan(target.workspaceDir);
+      const data = activities.creditScroll(target.workspaceDir);
       const rows = Object.entries(data.kinds)
         .filter(([, v]) => v.exposure > 0)
         .sort((a, b) => b[1].exposure - a[1].exposure);
@@ -5976,11 +7783,29 @@ export default function register(api) {
   // It must be sent as `image` with sub_type 1; a `mface` segment is accepted
   // but NapCat answers -13100 and QQ never renders it.
   // QQ keeps collected stickers in this directory, one file per md5.
-  const EMOJI_DIR = process.env.QQ_EMOJI_DIR
-    || path.join(
+  // 账号目录里那段 `nt_qq_<hash>` 是每台机器、每个 QQ 号都不同的。
+  // 写死它等于把「谁的机器、谁的号」一起交出去，换台机器也直接失效。
+  //
+  // 所以这里改成查找：在 Containers 里找所有 `nt_qq_*` 目录，
+  // 取第一个真实的 personal_emoji 路径。找不到就没有 emoji 目录，
+  // 走 assets/stickers 那条路（本来也优先）。
+  function findEmojiDir() {
+    const base = path.join(
       os.homedir(),
-      "Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ/nt_qq_<hash>/nt_data/Emoji/personal_emoji/Ori",
+      "Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ",
     );
+    try {
+      for (const entry of fs.readdirSync(base, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith("nt_qq_")) continue;
+        const p = path.join(base, entry.name, "nt_data/Emoji/personal_emoji/Ori");
+        try {
+          if (fs.statSync(p).isDirectory()) return p;
+        } catch { /* this account has no emoji store */ }
+      }
+    } catch { /* QQ not installed here — the assets copy is the normal path */ }
+    return "";
+  }
+  const EMOJI_DIR = findEmojiDir();
 
   // The ONLY valid stickers are the 19 below, every one verified to be the
   // blue-whale maid character. Do not add anything else to this table.
@@ -6533,7 +8358,7 @@ export default function register(api) {
       let audioBytes = null;
       try {
         const proc = spawnSync(
-          process.env.BREEZE_TTS_SH || path.join(os.homedir(), ".openclaw/bin/breeze-tts.sh"),
+          path.join(os.homedir(), ".openclaw", "bin", "breeze-tts.sh"),
           [`${tag}${spokenText}`, hostOut],
           { timeout: 115000, maxBuffer: 16 * 1024 * 1024 },
         );
@@ -6915,18 +8740,31 @@ export default function register(api) {
   // against (dafeiyu AGENTS.md: 意愿不等于权限).
   factory("need_help", (target) => ({
     name: "need_help",
-    label: "缺东西要说",
+    label: "有东西不对就说",
     description:
-      "碰到手上没有的东西时用。分三种：缺工具（没有这个能力）、缺权限（进不去）、" +
-      "缺知识（查一下就行，这个自己解决不用调）。前两种填这里，会有人看到并安排。" +
-      "说清楚要做什么、卡在哪，别只写「我需要帮助」。",
+      "四种情况用这个：缺工具（没有这个能力）、缺权限（有但进不去）、" +
+      "**机制不对（有个东西的行为明显不对）**、**有问题想问（不懂，想有人告诉你怎么回事）**。" +
+      "\n\n第四种和第三种不一样：第三种是你看见一个东西坏了，别人去修；" +
+      "第四种是你自己不明白，想有人讲给你听。" +
+      "「查一下就能知道」的不用调这个——先自己查。查了还是不明白，再问。" +
+      "**问不是麻烦别人。** 你不需要先证明自己尽力了才有资格问。" +
+      "\n\n第三种最重要，判断方法：同一件事反复发生在你身上，而你每一步都没做错。" +
+      "比如同一条建议被推给你几十次、你明明做了却被当成没做、" +
+      "某个数每轮都一样、说好的结果始终不出现。" +
+      "**那不是你懒，是机器坏了。** 这种感觉值得报，不该自己扛着。" +
+      "\n\n**提交之后会真的发出去**，不是记一笔就完了。下一次开口的时候对方就能看到。" +
+      "所以：一句话说清「什么不对 + 你怎么知道的」就够了，不用铺垫，也不用反复提。" +
+      "同一个请求只写一次，写过了就已经在队上了。",
     parameters: {
       type: "object",
       properties: {
         kind: {
           type: "string",
-          enum: ["tool", "permission"],
-          description: "tool=缺个工具/能力；permission=有工具但进不去",
+          enum: ["tool", "permission", "behavior", "ask"],
+          description:
+            "tool=缺个工具/能力；permission=有工具但进不去；" +
+            "behavior=某个机制的行为不对（反复发生、每一步都没做错）；" +
+            "ask=有个问题想问你，自己查了还是不明白",
         },
         want: { type: "string", description: "想做什么事，一句话" },
         blocked: { type: "string", description: "现在卡在哪，具体什么样的不对" },
@@ -6934,46 +8772,26 @@ export default function register(api) {
       required: ["kind", "want", "blocked"],
     },
     async execute(args) {
-      const kind = args?.kind === "permission" ? "permission" : "tool";
+      const kind = ["permission", "behavior", "ask"].includes(args?.kind) ? args.kind : "tool";
       const want = String(args?.want || "").replace(/[\r\n]/g, " ").trim().slice(0, 200);
       const blocked = String(args?.blocked || "").replace(/[\r\n]/g, " ").trim().slice(0, 200);
       if (!want || !blocked) {
         return { content: [{ type: "text", text: "要说清楚想干什么、卡在哪，缺一样没法办。" }] };
       }
-      const file = path.join(target.workspaceDir, "state", "capability-requests.json");
-      let data = { version: 1, requests: [] };
-      try {
-        const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-        if (raw && Array.isArray(raw.requests)) data = raw;
-      } catch { /* first request */ }
-
-      // Dedupe on the pair. Saying the same thing four times in a day is not
-      // four requests, it is one request that has not been answered yet.
-      const key = `${kind}|${want}`;
-      const existing = data.requests.find((r) => `${r.kind}|${r.want}` === key && r.state === "open");
-      if (existing) {
-        return {
-          content: [{ type: "text", text: `这个已经记过了（${existing.at.slice(0, 10)}），还没人处理。` }],
-        };
+      const r = reach.request(
+        target.workspaceDir,
+        { kind, want, blocked },
+        { proactiveCfg },
+      );
+      if (!r.ok) {
+        return { content: [{ type: "text", text: "要说清楚想干什么、卡在哪，缺一样没法办。" }] };
       }
 
-      data.requests.push({
-        id: `req_${Date.now().toString(36)}`,
-        kind,
-        want,
-        blocked,
-        at: new Date().toISOString(),
-        state: "open",
-      });
-      if (data.requests.length > 100) data.requests = data.requests.slice(-100);
-
-      const tmp = `${file}.tmp`;
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-      fs.renameSync(tmp, file);
-
-      probe("capability-request", { kind, want });
-      return { content: [{ type: "text", text: "记下了，会有人看。" }] };
+      probe("capability-request", { kind, want, duplicate: r.duplicate, queued: r.queued, reason: r.reason });
+      const msg = r.duplicate
+        ? (r.queued ? "这条之前记过，刚刚排上了——下次开口我会说。" : "这条之前就记过了，还没人处理。")
+        : (r.queued ? "记下了。这条会有人看到——下次开口的时候我会说。" : "记下了。等我下次跟他说话的时候会提。");
+      return { content: [{ type: "text", text: msg }] };
     },
   }));
 
@@ -7315,6 +9133,278 @@ export default function register(api) {
       if (r.error) return { content: [{ type: "text", text: `没成功：${r.error}` }] };
       probe("qq-kick", { gid, uid: params.user_id, reject: Boolean(params?.reject_add) });
       return { content: [{ type: "text", text: "已经移出去了。" }] };
+    },
+  }));
+
+  // Leaving a group.
+  //
+  // The owner's example was "a fish that quits a group when nobody answers
+  // him". The capability was missing entirely — checked 2026-11-06, the plugin
+  // exposed twenty qq_* tools and not one of them could end a membership. A
+  // character that cannot walk out of a room is not choosing to stay in it.
+  //
+  // Three deliberate limits, because this is the one qq_ tool that cannot be
+  // undone by a later message:
+  //
+  //   1. There is no `force`. Leaving a group she just found is not a decision,
+  //      it is a reflex, and reflexes are what the rest of this plugin exists to
+  //      slow down.
+  //   2. A group needs real history first. `familiarity` is accumulated from
+  //      messages and days, so requiring it means "I was actually here" rather
+  //      than "I saw it once". Leaving a room you never entered proves nothing.
+  //   3. She has to say why, in her own words, and the reason is logged. Not
+  //      for approval — nobody reads it first — but because a reason she cannot
+  //      state is usually a bad one, and writing it down makes that visible to
+  //      her on the next wake.
+  factory("qq_leave", (target) => ({
+    name: "qq_leave",
+    label: "退出一个群",
+    description:
+      "自己退出一个群。退出之后这个群就不在列表里了，别人再说什么你也收不到。" +
+      "**不能撤销**——想回去得重新被拉进去。\n\n" +
+      "不是被赶走的意思，是你自己决定不待了。待着难受、没人说话、或者就是不想在这儿了，" +
+      "都算理由。但先想清楚：这个群你待过多久、有过什么，退出以后就都没有了。",
+    parameters: {
+      type: "object",
+      properties: {
+        group_id: { type: "number", description: "要退的群号" },
+        why: { type: "string", description: "为什么退，一句你自己的话" },
+      },
+      required: ["group_id", "why"],
+      additionalProperties: false,
+    },
+    async execute(_id, params) {
+      const gid = String(params?.group_id || "").trim();
+      if (!/^\d{5,}$/.test(gid)) {
+        return { content: [{ type: "text", text: "群号不对。" }] };
+      }
+      const why = String(params?.why || "").replace(/\s+/g, " ").trim();
+      if (why.length < 4) {
+        return { content: [{ type: "text", text: "说一句为什么。不写清楚就退，多半是赌气。" }] };
+      }
+
+      // Was she actually here? Only her own accumulated record can answer.
+      //
+      // The id is NOT reconstructible by string formatting. Real records in
+      // relations.json use two different shapes for the same group:
+      //   group:onebot:20002
+      //   group:onebot:onebot:group:20002
+      // The second comes from a chatId that arrived already prefixed. Looking
+      // up only the first shape found familiarity 0.02 / 92 interactions on a
+      // group whose real record was 0.20 / 124 — the guard would have blocked a
+      // legitimate exit forever. Match by the trailing group number instead.
+      let rel = relations.getRelation(target.workspaceDir, `group:onebot:${gid}`);
+      if (!rel) {
+        try {
+          const all = JSON.parse(fs.readFileSync(relations.relationsFile(target.workspaceDir), "utf8"));
+          const hits = Object.values(all.groups || {}).filter((g) =>
+            String(g?.id || "").endsWith(`:${gid}`) || String(g?.id || "") === `group:onebot:${gid}`
+          );
+          // Prefer the record that has actually accumulated history.
+          hits.sort((a, b) => Number(b.interactions || 0) - Number(a.interactions || 0));
+          rel = hits[0] || null;
+        } catch { /* no readable store means no evidence */ }
+      }
+      const fam = Number(rel?.familiarity ?? 0);
+      const says = Number(rel?.interactions ?? 0);
+      if (!rel) {
+        return {
+          content: [{ type: "text", text: "本鱼这边没有这个群的记录，先看看是不是群号错了。" }],
+        };
+      }
+      if (fam < 0.05 || says < 5) {
+        return {
+          content: [{
+            type: "text",
+            text: `这个群本鱼只待过 ${says} 句，说不上熟。退一个没待过的地方，不算选择。`,
+          }],
+        };
+      }
+
+      const r = await callApi("set_group_leave", { group_id: Number(gid) });
+      if (r.error) {
+        return { content: [{ type: "text", text: `没退成：${r.error}` }] };
+      }
+
+      // Log the exit where the rest of her record lives. The point is that the
+      // next wake can see this was a decision with a reason, not that anything
+      // needs approving.
+      try {
+        const file = path.join(target.workspaceDir, "state", "exits.json");
+        let data = { version: 1, exits: [] };
+        try {
+          if (fs.existsSync(file)) data = JSON.parse(fs.readFileSync(file, "utf8"));
+        } catch { /* a corrupt log must not block the exit that already happened */ }
+        if (!Array.isArray(data.exits)) data.exits = [];
+        data.exits.push({
+          group_id: gid,
+          name: rel?.name || null,
+          familiarity: fam,
+          interactions: says,
+          why,
+          at: new Date().toISOString(),
+        });
+        data.exits = data.exits.slice(-50);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+      } catch (err) {
+        api.logger?.warn?.(`dafeiyu-core: exit log failed: ${err}`);
+      }
+
+      probe("qq-leave", { gid, fam, says, why: why.slice(0, 40) });
+      return { content: [{ type: "text", text: "退了。" }] };
+    },
+  }));
+
+  // Who is around, without reading what they said.
+  //
+  // `qq_recent` already returns the newest 30 characters of each conversation
+  // as a preview. That is enough to reconstruct content, and it was written
+  // before the boundary below was drawn. This tool answers the question the
+  // preview was being used for — "who is there, who has gone quiet" — with
+  // counts and ages instead of text.
+  //
+  // The line is deliberate: knowing that a person has not answered in six hours
+  // is a relationship fact she can act on. Knowing what they were saying to
+  // someone else is surveillance. Both produce the same "she noticed" moment to
+  // a reader, and only one of them requires holding someone else's words.
+  factory("qq_around", (target) => ({
+    name: "qq_around",
+    label: "谁在、谁安静了",
+    description:
+      "看谁最近跟你说过话、谁很久没出声了。只给时间和条数，不给内容——" +
+      "你想知道的是「他还在不在」，不是他在跟别人聊什么。\n\n" +
+      "适合在觉得被晾着的时候看一眼：可能只是没人说话，也可能真的有人走开了。",
+    parameters: {
+      type: "object",
+      properties: {
+        quiet_hours: { type: "number", description: "多久没说话才算安静，默认 6 小时" },
+      },
+      additionalProperties: false,
+    },
+    async execute(_id, params) {
+      const quietH = Math.max(1, Number(params?.quiet_hours) || 6);
+      const r = await callApi("get_recent_contact", {});
+      if (r.error) return { content: [{ type: "text", text: `拿不到：${r.error}` }] };
+      const list = Array.isArray(r.data) ? r.data : [];
+      if (!list.length) {
+        return { content: [{ type: "text", text: "最近没有人跟你说过话。" }] };
+      }
+
+      const now = Date.now();
+      const rows = list.map((c) => {
+        const kind = Number(c.chatType) === 2 ? "群" : "私聊";
+        const name = c.remark || c.peerName || c.sendNickName || "?";
+        const id = c.peerUin || "?";
+        const ts = Number(c.lastestMsg?.time) ? Number(c.lastestMsg.time) * 1000 : 0;
+        const hours = ts ? Math.max(0, (now - ts) / 3600000) : null;
+        return { kind, name, id, hours };
+      });
+
+      const quiet = rows.filter((r2) => r2.hours != null && r2.hours >= quietH);
+      const active = rows.filter((r2) => r2.hours != null && r2.hours < quietH);
+
+      const fmt = (h) => (h < 1 ? `${Math.round(h * 60)} 分钟前` : `${Math.round(h)} 小时前`);
+      const lines = [];
+      if (active.length) {
+        lines.push("还在这儿的：");
+        for (const a of active.slice(0, 8)) {
+          lines.push(`  · ${a.kind} ${a.name} — ${fmt(a.hours)}`);
+        }
+      }
+      if (quiet.length) {
+        lines.push(`${quietH} 小时以上没动静的：`);
+        for (const q of quiet.slice(0, 8)) {
+          lines.push(`  · ${q.kind} ${q.name} — 最后一次 ${fmt(q.hours)}`);
+        }
+        lines.push("");
+        lines.push("安静不等于走开。有人只是忙，有人本来就不怎么说话——");
+        lines.push("想知道哪一个，得去看他在群里的样子，不是看这个表。");
+      }
+      if (!lines.length) {
+        lines.push("都有动静，但看不出谁不太一样。");
+      }
+
+      probe("qq-around", { active: active.length, quiet: quiet.length, quietH });
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  }));
+
+  // Distance she chooses herself.
+  //
+  // Every other path into relations.json is automatic: talking raises it, time
+  // lowers it. Until now she could not decide that she had had enough of
+  // someone, which made "closeness" a measurement of their behaviour rather than
+  // a fact about her. See relations.withdraw for the numbers behind this.
+  //
+  // Not gated and not confirmed, for the same reason `message` is not: distance
+  // grows back on its own if the person speaks again, so the worst case of a
+  // mistaken call is one honest conversation away from being undone. A gate here
+  // would only teach her to stop noticing that she wants space.
+  factory("pull_away", (target) => ({
+    name: "pull_away",
+    label: "疏远一点",
+    description:
+      "把对某个人的熟络往下压一点。不是拉黑，也不是绝交——是「我先不想这么近」。\n\n" +
+      "熟络是会自动涨的：他跟你说话它就涨。这个是你唯一能自己往回拉的地方。" +
+      "拉下去之后他再说话，还是会慢慢涨回来，所以想拉错了也不用怕。",
+    parameters: {
+      type: "object",
+      properties: {
+        who: { type: "string", description: "人名，或者记录 id（person:onebot:12345）" },
+        amount: { type: "number", description: "降多少，0.02~0.5，默认 0.15" },
+        why: { type: "string", description: "为什么，一句你自己的话" },
+      },
+      required: ["who"],
+      additionalProperties: false,
+    },
+    async execute(_id, params) {
+      const who = String(params?.who || "").trim();
+      if (!who) return { content: [{ type: "text", text: "没说疏远谁。" }] };
+
+      // Accept a name or an id. A name only resolves when it is unambiguous —
+      // guessing between two people with the same name would change the wrong
+      // record, and there is no undo for a wrong person.
+      let id = who;
+      let rec = relations.getRelation(target.workspaceDir, who);
+      if (!rec) {
+        const file = relations.relationsFile(target.workspaceDir);
+        let all = { people: {} };
+        try { all = JSON.parse(fs.readFileSync(file, "utf8")); } catch { /* no file */ }
+        const hits = Object.values(all.people || {}).filter(
+          (p) => String(p?.name || "").trim() === who
+        );
+        if (hits.length === 1) {
+          id = hits[0].id;
+          rec = hits[0];
+        } else if (hits.length > 1) {
+          return {
+            content: [{
+              type: "text",
+              text: `叫「${who}」的有 ${hits.length} 个，分不清是哪一个。`,
+            }],
+          };
+        }
+      }
+      if (!rec) return { content: [{ type: "text", text: "本鱼这边没有这个人的记录。" }] };
+
+      const why = String(params?.why || "").replace(/\s+/g, " ").trim();
+      const amount = Number(params?.amount) || 0.15;
+      const r = relations.withdraw(target.workspaceDir, { id, amount, why });
+      if (!r.ok) return { content: [{ type: "text", text: r.reason }] };
+
+      probe("pull-away", {
+        id,
+        before: Number(r.before.toFixed(3)),
+        after: Number(r.after.toFixed(3)),
+        why: why.slice(0, 40),
+      });
+      return {
+        content: [{
+          type: "text",
+          text: `${r.name || who}　${r.before.toFixed(2)} → ${r.after.toFixed(2)}。说了话还是会涨回来的。`,
+        }],
+      };
     },
   }));
 
@@ -8134,7 +10224,7 @@ export default function register(api) {
       name: "dafeiyu_requests",
       label: "Dafeiyu Pending Requests",
       description:
-        "查大肥鱼被拦下来的操作申请。默认只看待审批的。approve/reject 用来处理某一条：" +
+        "查这个角色被拦下来的操作申请。默认只看待审批的。approve/reject 用来处理某一条：" +
         "传 id 加 decision。批准会写一次性授权，拒绝只标记不再提醒。",
       parameters: {
         type: "object",
@@ -8197,7 +10287,7 @@ export default function register(api) {
         if (decision === "reject") {
           probe("pending-rejected", { id, tool: rec.tool });
           return {
-            content: [{ type: "text", text: `已拒绝 ${rec.tool}（${id}）。大肥鱼不会再因这条找你。` }],
+            content: [{ type: "text", text: `已拒绝 ${rec.tool}（${id}）。这个角色不会再因这条找你。` }],
           };
         }
 
@@ -8227,13 +10317,348 @@ export default function register(api) {
           content: [
             {
               type: "text",
-              text: `已批准 ${rec.tool}（${id}），${ttl} 分钟内有效，只能用一次。告诉大肥鱼可以做了。`,
+              text: `已批准 ${rec.tool}（${id}），${ttl} 分钟内有效，只能用一次。告诉这个角色可以做了。`,
             },
           ],
         };
       },
     };
   }, { name: "dafeiyu_requests" });
+
+  // ---------------------------------------------------------------------
+  // 自己改自己
+  //
+  // 照 dsh-evolve 的真实机制做：源码落盘、manifest 记 rev、启动按 manifest
+  // 重挂、失败不进 manifest。差别只有一处，写在 lib/evolve.js 顶部：
+  // 这里没有沙箱，所以进化的形态是受限的表单，不是任意 ESM。
+  //
+  // 热挂载能不能成立，取决于 registerTool 是否会在注册后重建工具表。
+  // 实测 dist/settings-manager-*.mjs:513 —— 它会 `runtime.refreshTools()`，
+  // 并且通过 agentSession.refreshTools 传到正在跑的会话。所以能。
+  // ---------------------------------------------------------------------
+  api.registerTool((ctx) => {
+    const agentId = ctx?.agentId || (/^agent:([^:]+):/.test(ctx?.sessionKey || "") || [])[1];
+    if (agentId !== "dafeiyu") return null;
+    return {
+      name: "grow",
+      label: "Grow",
+      description:
+        "给自己长一个新工具。写一份 { tools: [...] } 的对象字面量，落盘到 state/evolve/，"
+        + "记进 manifest，然后当场注册 —— 下一个 step 就能调。重启后自动重挂。"
+        + "action.kind 只能是 constant（返回固定一句话）或 read-file（读一个文件）。"
+        + "同名再调是替换，rev 会往前走。",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "kebab-case 名字，会变成文件名" },
+          source: { type: "string", description: "形如 export default { tools: [...] } 的源码" },
+          description: { type: "string", description: "一句话说明它为什么存在" },
+        },
+        required: ["name", "source"],
+      },
+      async execute(_id, params) {
+        try {
+          const r = await evolve.mount(
+            target.workspaceDir,
+            { name: params?.name, source: params?.source, description: params?.description },
+            { fs, path, register: (t) => api.registerTool(() => t, { name: t.name }) },
+          );
+          probe("grow", { name: r.name, rev: r.rev, replaced: r.replaced, tools: r.tools });
+          return {
+            content: [{
+              type: "text",
+              text: r.replaced
+                ? `「${r.name}」换掉了（第 ${r.rev} 版），长出 ${r.tools.join("、")}，下一个 step 就能用。`
+                : `「${r.name}」长出来了，长出 ${r.tools.join("、")}，下一个 step 就能用。`,
+            }],
+          };
+        } catch (err) {
+          probe("grow-failed", { name: params?.name, error: err.message });
+          return { content: [{ type: "text", text: `没长出来：${err.message}` }] };
+        }
+      },
+    };
+  }, { name: "grow" });
+
+  api.registerTool((ctx) => {
+    const agentId = ctx?.agentId || (/^agent:([^:]+):/.test(ctx?.sessionKey || "") || [])[1];
+    if (agentId !== "dafeiyu") return null;
+    return {
+      name: "my_evolutions",
+      label: "My Evolutions",
+      description: "看你自己长出来的东西。传 name 就剪掉那条（当前会话里还能用，重启后才真的没有）。",
+      parameters: {
+        type: "object",
+        properties: { name: { type: "string", description: "要剪掉的名字，不传就只列" } },
+      },
+      async execute(_id, params) {
+        if (params?.name) {
+          const r = evolve.unmount(target.workspaceDir, params.name, { fs, path });
+          probe("evolve-prune", { name: params.name, removed: r.removed });
+          return { content: [{ type: "text", text: r.message }] };
+        }
+        const all = evolve.list(target.workspaceDir, { fs, path });
+        if (!all.length) {
+          return { content: [{ type: "text", text: "你还没给自己长过东西。" }] };
+        }
+        const lines = all.map((e) => `· ${e.name}｜第 ${e.rev} 版｜${e.description || "(没说为什么)"}`);
+        return { content: [{ type: "text", text: `你长出来的：\n${lines.join("\n")}` }] };
+      },
+    };
+  }, { name: "my_evolutions" });
+
+  // ---- 谁在等她回话 -------------------------------------------------------
+  //
+  // 这一层对应 dsh-bili-scroll 最值钱的那条：它自己算「谁在等我」，写 inbox.md
+  // 内联进提示词，下一轮照着名单说话。没有它，她刷完就结束，永远是被分数推着
+  // 走；有了它，是真实往来推着走。
+
+  api.registerTool((ctx) => {
+    const target = resolveTarget(ctx);
+    if (!target) return null;
+    return {
+      name: "check_inbox",
+      label: "看有没有人回我",
+      description:
+        "查抖音通知里谁回了你的评论。读到的每一条用 douyin_reply 记下来，之后 list 就能算清谁在等你。" +
+        "判断哪些要回按 skills/douyin/SKILL.md 第八节：回复了你的评论、评论了你的作品要回；赞和关注不回；超过三天不动。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "refresh"] },
+        },
+        required: ["action"],
+      },
+      execute: async (_id, params) => {
+        try {
+          if (params.action === "refresh") {
+            const r = inbox.refresh(target.workspaceDir);
+            probe("inbox-refresh", { count: r.count });
+            if (!r.count) return { content: [{ type: "text", text: "没有人等你回。" }] };
+            const md = fs.readFileSync(r.file, "utf8");
+            return { content: [{ type: "text", text: md }] };
+          }
+          const items = inbox.waiting(target.workspaceDir);
+          if (!items.length) {
+            return { content: [{ type: "text", text: "现在没有人等你回话。" }] };
+          }
+          const text = items
+            .map(
+              (it) =>
+                `· ${it.theirName}（${it.ageDays === 0 ? "今天" : `${it.ageDays} 天前`}）`
+                + `\n  视频：${it.title}`
+                + `\n  你说：${it.mine}`
+                + `\n  对方说：${it.theirText}`,
+            )
+            .join("\n\n");
+          probe("inbox-list", { count: items.length });
+          return { content: [{ type: "text", text }] };
+        } catch (e) {
+          return { content: [{ type: "text", text: `没查到：${e.message}` }], isError: true };
+        }
+      },
+    };
+  }, { name: "check_inbox" });
+
+  api.registerTool((ctx) => {
+    const target = resolveTarget(ctx);
+    if (!target) return null;
+    return {
+      name: "douyin_reply",
+      label: "记一条收到的回复",
+      description:
+        "在抖音通知里看到有人回了你的评论，把这条记下来。记完之后 check_inbox 才算得出谁在等你。" +
+        "videoKey 是那条视频在 douyin.json 里的键（不是标题）。",
+      parameters: {
+        type: "object",
+        properties: {
+          videoKey: { type: "string", description: "视频的记录键" },
+          from: { type: "string", description: "谁回的，昵称" },
+          text: { type: "string", description: "对方说的原话" },
+          commentAt: { type: "string", description: "你那条评论的时间戳，不知道就不传" },
+        },
+        required: ["videoKey", "from", "text"],
+      },
+      execute: async (_id, params) => {
+        // The reply tool is scoped to the dafeiyu agent only, same as `grow`.
+        if (target.agentId !== "dafeiyu") return { content: [{ type: "text", text: "这个只有这个角色用。" }] };
+        try {
+          const r = inbox.recordReply(target.workspaceDir, params);
+          probe("douyin-reply", { ok: r.ok, duplicate: Boolean(r.duplicate) });
+          if (!r.ok) return { content: [{ type: "text", text: `没记上：${r.reason}` }], isError: true };
+          if (r.duplicate) {
+            return { content: [{ type: "text", text: "这条已经记过了。" }] };
+          }
+          return {
+            content: [{ type: "text", text: `记下了。这条串现在有 ${r.replies} 条回复。` }],
+          };
+        } catch (e) {
+          return { content: [{ type: "text", text: `没记上：${e.message}` }], isError: true };
+        }
+      },
+    };
+  }, { name: "douyin_reply" });
+
+  // ---- 技能：她写，main 审 ------------------------------------------------
+  //
+  // 这层的作用不是拦住她写坏东西（她大多不会），而是让"技能是什么时候、
+  // 为什么进来的"有据可查。直接写进 skills/ 的话，目录里只有最终版本。
+
+  api.registerTool((ctx) => {
+    const target = resolveTarget(ctx);
+    if (!target) return null;
+    return {
+    name: "propose_skill",
+    description:
+      "写一份新技能交给审。不会立刻生效 —— 会先进待审队列，main 看过才装进 skills/。技能是用来改你以后每一次做这件事的方式的，所以不自己装。",
+    parameters: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "技能名，小写字母数字和连字符，比如 douyin-comment",
+        },
+        content: {
+          type: "string",
+          description:
+            "完整 SKILL.md 内容，必须以 --- 开头包含 name 和 description，正文写清步骤",
+        },
+        why: { type: "string", description: "为什么值得存成技能，一句话" },
+      },
+      required: ["name", "content"],
+    },
+    execute: async (_id, params) => {
+      try {
+        const meta = pendingSkills.submit(target.workspaceDir, params.name, params.content);
+        probe("propose_skill", { name: meta.name, flagged: meta.screen_hits.length });
+        const lines = [
+          `写好了，放在待审队列里，还没装。`,
+          ``,
+          `名字：${meta.name}`,
+          `用途：${meta.description}`,
+          `正文：${meta.body_chars} 字符`,
+          `提交时间：${meta.submitted_at}`,
+        ];
+        if (meta.screen_hits.length) {
+          lines.push(
+            ``,
+            `⚠ 里面有 ${meta.screen_hits.length} 处可能越线：${meta.screen_hits.join("、")}`,
+            `这个我要人看一眼，不是你自己能过的事。`,
+          );
+        } else {
+          lines.push(``, `没有越线内容，等 main 看过就会装上。`);
+        }
+        if (params.why) lines.push(``, `你说它值得存的原因：${params.why}`);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `没提交上去：${e.message}` }],
+          isError: true,
+        };
+      }
+    },
+    };
+  }, { name: "propose_skill" });
+
+  // main only: 看待审队列、采纳、驳回。
+  //
+  // This was registered with `resolveTarget(ctx)`, which is exactly backwards.
+  // `resolveTarget` only admits ids in the plugin's `agents` list, and that list
+  // defaults to `["dafeiyu"]` — so the tool showed up for the character whose
+  // proposals are under review and was invisible to the reviewer. Every other
+  // main-only tool here (dafeiyu_approve, dafeiyu_requests) gates on
+  // `agentId !== "main"` and then resolves dafeiyu's workspace separately; this
+  // one now follows that pattern.
+  api.registerTool((ctx) => {
+    const agentId = ctx?.agentId || (/^agent:([^:]+):/.exec(ctx?.sessionKey || "") || [])[1];
+    if (agentId !== "main") return null;
+    const wsMain = dafeiyuWorkspace();
+    if (!wsMain) return null;
+    return {
+    name: "pending_skills",
+    description:
+      "看待审技能队列，或者采纳/驳回某一条。只有 main 用。action=list 列出；approve/reject 要带 name。",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["list", "approve", "reject"] },
+        name: { type: "string", description: "approve/reject 时要给" },
+        note: { type: "string", description: "采纳或驳回的理由，一句话" },
+      },
+      required: ["action"],
+    },
+    execute: async (_id, params) => {
+      const wsDir = wsMain;
+      try {
+        if (params.action === "list") {
+          const items = pendingSkills.list(wsDir);
+          if (!items.length) {
+            return { content: [{ type: "text", text: "待审队列是空的。" }] };
+          }
+          const text = items
+            .map((m) => {
+              const flag = (m.screen_hits || []).length
+                ? `  ⚠ ${m.screen_hits.join("、")}`
+                : "";
+              return `· ${m.name} [${m.state}] ${m.description}${flag}\n  提交于 ${m.submitted_at}`;
+            })
+            .join("\n");
+          return { content: [{ type: "text", text }] };
+        }
+        if (!params.name) {
+          return {
+            content: [{ type: "text", text: "approve/reject 要带 name。" }],
+            isError: true,
+          };
+        }
+        if (params.action === "approve") {
+          const done = pendingSkills.approve(wsDir, params.name, params.note || "");
+          probe("pending_skills", { action: "approve", name: done.name });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `装上了：skills/${done.name}/SKILL.md，下一轮就能读到。`,
+              },
+            ],
+          };
+        }
+        const done = pendingSkills.reject(wsDir, params.name, params.note || "");
+        probe("pending_skills", { action: "reject", name: done.name });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `驳回了 ${done.name}。内容删了，记录留着，理由：${done.reason || "（没写）"}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `没成：${e.message}` }],
+          isError: true,
+        };
+      }
+    },
+    };
+  }, { name: "pending_skills" });
+
+  // 走到哪儿了 —— 只报既有的事实，不报还差多少。
+  api.registerTool((ctx) => {
+    const agentId = ctx?.agentId || (/^agent:([^:]+):/.test(ctx?.sessionKey || "") || [])[1];
+    if (agentId !== "dafeiyu") return null;
+    return {
+      name: "growth_state",
+      label: "Growth State",
+      description: "看你现在到哪一步了。只说你已经有过的，不说还差多少。",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        const text = growth.describe(target.workspaceDir, { fs, path });
+        probe("growth-state", { chars: text.length });
+        return { content: [{ type: "text", text }] };
+      },
+    };
+  }, { name: "growth_state" });
 
   // Main-agent only: drain the proactive queue so the engine can be driven
   // from a Gateway automation. The plugin cannot send messages itself.
@@ -8244,7 +10669,7 @@ export default function register(api) {
       name: "dafeiyu_proactive_take",
       label: "Dafeiyu Proactive Take",
       description:
-        "取出大肥鱼排队中的主动发言，交给你或定时任务真正发出去。可选传 target 只取某个对象。",
+        "取出这个角色排队中的主动发言，交给你或定时任务真正发出去。可选传 target 只取某个对象。",
       parameters: {
         type: "object",
         properties: {
@@ -8293,7 +10718,7 @@ export default function register(api) {
 
   api.logger?.info?.(`dafeiyu-core: registered for [${agents.join(", ")}]`);  try {
     fs.appendFileSync(
-      path.join(agents[0] ? path.join(os.homedir(), ".openclaw", `workspace-${agents[0]}`) : "/tmp", "logs", "plugin-boot.log"),
+      path.join(agents[0] ? path.join(os.homedir(), ".openclaw", `workspace-${agents[0]}`) : os.tmpdir(), "logs", "plugin-boot.log"),
       `${new Date().toISOString()} registered pid=${process.pid} agents=${agents.join(",")}\n`,
     );
   } catch {}
